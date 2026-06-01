@@ -188,6 +188,10 @@ cython_debug/
 #   option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 /.idea/
+# Volumes
+#   Docker volumes or local data storage directories that should not be version controlled
+volumes/
+
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.
