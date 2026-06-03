@@ -192,6 +192,9 @@ cython_debug/
 #   Docker volumes or local data storage directories that should not be version controlled
 volumes/
 
+# Node / frontend
+node_modules/
+
 
 # Abstra
 #   Abstra is an AI-powered process automation framework.
