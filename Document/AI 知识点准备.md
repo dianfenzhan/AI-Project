@@ -1,48 +1,222 @@
 # Rag
+
+## 面试总回答
+
+我当前项目里的 RAG 不是简单“向量库搜一下再交给大模型”，而是一个面向 SEO 文章生成的检索增强链路：
+
+1. 文档上传后，先解析 PDF / MD / TXT / DOCX。
+2. 使用 `RecursiveCharacterTextSplitter` 做切块，当前是 `chunk_size=512`、`chunk_overlap=128`。
+3. 使用 `BAAI/bge-small-zh-v1.5` 做中文 embedding，向量维度是 512。
+4. 同一批 chunk 同时写入 Milvus 和 Elasticsearch：
+   - Milvus 负责语义召回。
+   - Elasticsearch 负责关键词召回。
+5. 检索时先做 query rewrite，生成多个检索 query。
+6. 每个 query 都走 Milvus + Elasticsearch 双路召回。
+7. 多路结果合并去重后，使用 FlashRank 做 rerank，最终返回 Top-K 证据。
+8. 生成文章时把知识库证据和 SerpAPI 搜索结果一起传给 LLM，并返回 citations 和 quality_report。
+
+一句话总结：
+
+> 我的 RAG 重点是提升召回覆盖率、控制生成幻觉、让文章内容可溯源。核心实现是 query rewrite + Milvus/ES 双路召回 + FlashRank 重排 + citation + 生成后质量评估。
+
 ## 切块
-如何语义分块，如何 overlap
 
-### 方案一：
-RecursiveCharacterTextSpliter实现段落，标点符号以及空格切分
+### 当前项目怎么做
 
-tiktoken 可以控制分块文本在固定长度以内
+当前项目使用 LangChain 的 `RecursiveCharacterTextSplitter` 切块：
 
-然后 overlap 100个 token
+- `chunk_size=512`
+- `chunk_overlap=128`
+- 分隔符包含：段落、换行、中文句号、感叹号、问号、英文标点、空格等
+- 每个 chunk 会带上 metadata，例如 `filename`、`tenant_id`、`collection_name`、`chunk_id`
 
-### 方案二：
-side LLM，帮助切块，真正实现语义切分，并且实现 overlap
+项目里现在是“字符长度控制”，不是 token 级控制。面试时不要说当前已经用了 tiktoken 控 token，否则和代码不一致。
+
+### 为什么要 overlap
+
+Overlap 是为了解决“切块边界导致语义断裂”的问题。
+
+比如一段话前半段讲问题，后半段讲解决方案，如果正好被切成两个 chunk，单独召回其中一个可能上下文不完整。设置 128 overlap 后，相邻 chunk 会保留一部分重复内容，能提高召回后的语义完整性。
+
+### 为什么用 RecursiveCharacterTextSplitter
+
+它会按优先级递归切分：
+
+1. 先按段落切。
+2. 段落太长再按换行切。
+3. 还太长再按句号、问号、感叹号切。
+4. 最后才按空格或字符切。
+
+这样比简单按固定长度截断更接近自然语言结构。
+
+### 面试回答
+
+切块的目标不是越细越好，而是在召回粒度和上下文完整性之间做平衡。我的项目里使用 `RecursiveCharacterTextSplitter`，按段落、换行、中文标点递归切分，当前 chunk size 是 512，overlap 是 128。这样既不会让 chunk 太大引入太多噪声，也不会太小导致语义不完整。后续如果文档结构更复杂，我会进一步按 Markdown 标题、章节、页面号做结构化切块。
+
+### 后续优化
+
+- 用 tiktoken 或模型 tokenizer 控制 token 数，而不是只控制字符数。
+- Markdown 文档按标题层级切块。
+- PDF 文档保留页码，便于 citation 溯源。
+- 对 FAQ、产品文档、SEO 方法论文档使用不同切块策略。
+- 增加 chunk 质量检查：空 chunk、重复 chunk、过长 chunk、无意义 chunk 不入库。
 
 ## 如何 query 改写
-### 方案一
-提示词模版+控制输入
 
-我们生成文章的业务流程是三段式生成的，主要通过 主题+关键词-》标题-》大纲-》正文。
+### 当前项目怎么做
 
-我们会在后台配置一个提示词模版，只让用户输入变量信息，这个可以有效控制提示词质量。由于上下文不是很多，因此我们会把全量上下文拼接以后一起给到LLM。
+当前项目已经在 LangGraph 里增加了 `rewrite_query` 节点。
 
-### 方案二
-小模型做上下文摘要+滑动窗口+query 改写
+原始 query 是：
 
-大模型做核心生成
+```text
+topic + keywords
+```
 
-我们文章优化的流程就相对复杂很多，上下文需要涵盖生成文章的上下文，SEO 方法论，每次的解决方案以及最后的效果，因此我们采取三部分数据作为大模型的上下文
+然后让 LLM 根据主题和关键词改写成 3-5 个中文检索 query，要求覆盖：
 
-+ 最近 2 次的解决方案以及反馈结果，包括全量的正文
-+ 之前改动的摘要
-+ RAG 出 SEO 的相关方法论
-+ 常见此类问题的解决方案（动态维护）
+- 主题背景
+- 用户痛点
+- 解决方案
+- FAQ
+- 不同 SEO 写作角度
+
+每个 query 都会走同一套 RAG 检索链路：
+
+```text
+query rewrite -> 多 query -> Milvus + Elasticsearch -> 合并去重 -> FlashRank rerank
+```
+
+### 为什么要 query 改写
+
+用户输入和知识库里的表达不一定一致。
+
+例如用户输入“AI 幻觉怎么解决”，知识库里可能写的是：
+
+- 事实一致性校验
+- 忠实度评估
+- groundedness
+- RAG 防编造
+- 引用溯源
+
+如果只用原始 query，可能漏召回。Query rewrite 的作用是把用户问题扩展成更贴近知识库表达的多个检索视角。
+
+### 面试回答
+
+我在 RAG 前面加了 query rewrite 节点，不是直接拿用户输入去搜。因为用户输入往往比较短，而且表达方式和知识库不一定一致。我的做法是让 LLM 先把 `topic + keywords` 改写成多个检索 query，覆盖背景、痛点、解决方案、FAQ 等角度，然后每个 query 都走 Milvus 和 Elasticsearch 双路召回。这样能提升 recall。为了避免召回变多后噪声变多，我最后会统一用 FlashRank rerank，只取 Top-K 证据进入生成阶段。
+
+### 和 prompt 模版的关系
+
+Prompt 模版主要控制“生成质量”，Query rewrite 主要控制“检索质量”。
+
+在我的项目里：
+
+- 标题、大纲、文章生成使用固定 prompt 结构，限制输出格式和内容方向。
+- Query rewrite 是在检索前发生，用来提升召回覆盖率。
+- 文章生成阶段再把 RAG 证据、网页搜索结果、用户选择的大纲一起交给 LLM。
+
+所以不能把 query rewrite 简单理解为“控制用户输入提示词”，它更像是 RAG 检索前的查询理解层。
+
+### 后续优化
+
+- 对 query rewrite 的结果做去重、黑名单过滤和长度限制。
+- 增加 HyDE：先生成一个假设答案，再用假设答案做向量检索。
+- 根据不同业务意图生成不同 query，例如产品介绍、FAQ、竞品对比、价格方案。
+- 记录每个 chunk 是被哪个 query 召回的，用于分析 query rewrite 是否有效。
 
 ## 如何双路召回
-切块，分别存入 ES 和 Milvus
 
-Milvus 稠密检索 + ES BM25 稀疏检索，智能权重+归一化处理，最终 rerank 出 10 个切块。
+### 当前项目怎么做
+
+项目中上传文档后，同一批 chunk 会写入两个系统：
+
+- Milvus：存储 dense embedding，用 COSINE 相似度做语义检索。
+- Elasticsearch：存储 text 字段，用 `match` 查询做全文检索。
+
+检索时：
+
+1. 对 query 生成 embedding。
+2. Milvus 召回 Top 20。
+3. Elasticsearch 召回 Top 20。
+4. 两路结果按文本去重合并。
+5. 使用 FlashRank 对合并后的候选统一 rerank。
+6. 最终返回 Top 10。
+
+注意：当前项目没有做“智能权重 + 归一化融合”，而是先合并去重，再交给 rerank。这样说更贴合代码。
+
+### 为什么要双路召回
+
+Milvus 和 Elasticsearch 解决的问题不一样：
+
+- Milvus 适合语义相似召回，比如“幻觉治理”和“减少模型编造”。
+- Elasticsearch 适合关键词精确匹配，比如品牌名、术语、型号、政策条款。
+
+只用向量召回，可能丢掉关键词精确命中的内容；只用关键词召回，又可能召不回表达不同但语义相同的内容。所以两路结合更稳。
+
+### 为什么要 rerank
+
+Milvus 的向量分数和 Elasticsearch 的 `_score` 不在同一个量纲，不能简单相加或直接排序。
+
+当前项目选择：
+
+```text
+Milvus 候选 + ES 候选 -> 去重合并 -> FlashRank rerank -> Top-K
+```
+
+FlashRank 是 cross-encoder 类重排，会同时看 query 和 passage，更适合做最终相关性排序。
+
+### 面试回答
+
+我的双路召回是 Milvus 稠密检索 + Elasticsearch 全文检索。Milvus 解决语义相似的问题，ES 解决关键词精确匹配的问题。两路召回后，我没有直接混合分数，因为两个系统的 score 不是一个量纲；我先按文本去重合并，再用 FlashRank 做重排，最终取 Top 10 作为 RAG 上下文。这样既保证召回覆盖，也保证最终进入 LLM 的上下文相关性更高。
+
+### 后续优化
+
+- Elasticsearch 中文分词优化，当前 standard analyzer 对中文不是最优。
+- 引入 RRF 或加权融合，在 rerank 前做更合理的候选排序。
+- 对不同来源设置召回配额，避免某一路结果完全压制另一边。
+- 增加离线评测集，用 recall@k、precision@k、MRR、NDCG 评估召回和重排效果。
 
 ## 知识库
-### 知识库更新
-SEO 方法论更新，企业产品文档升级的时候需要更新，保证知识库的时效性。
 
-### Agent 结束以后，反哺知识库
-优化文章以后，把问题，原因以及解决方案结构化入库，为之后优化提供标准。
+### 当前项目怎么做
+
+当前项目的知识库以 `tenant_id + collection_name` 做隔离：
+
+- Milvus collection 名称是 `collection_name_tenant_id`。
+- Elasticsearch index 名称也是 `collection_name_tenant_id`。
+- metadata 中也会冗余 `tenant_id` 和 `collection_name`，方便排查和二次校验。
+
+这样可以避免不同租户、不同知识库之间的数据混淆。
+
+### 知识库更新
+
+知识库需要在以下场景更新：
+
+- SEO 方法论更新。
+- 企业产品文档升级。
+- 价格、功能、政策发生变化。
+- 用户发现生成内容依据过旧。
+- 新增 FAQ、案例、竞品资料。
+
+面试回答：
+
+RAG 的质量很大程度取决于知识库质量。我会把知识库更新作为一个知识工程流程来做：文档更新后重新解析、切块、embedding，并写入 Milvus 和 ES。对于企业内部文档，要保留版本、来源、更新时间，避免模型基于过期资料生成。
+
+### Agent 结束以后反哺知识库
+
+文章优化或人工审核后，可以把高质量结果反哺知识库：
+
+- 用户问题。
+- 召回到的证据。
+- 最终采纳的文章段落。
+- 人工修改意见。
+- 质量评估结果。
+
+这些可以结构化入库，作为后续相似问题的知识来源。
+
+面试回答：
+
+我会把用户反馈和人工审核结果沉淀回知识库，形成闭环。比如某篇文章被人工修改过，我会记录修改前问题、修改后方案、采纳原因和对应证据。之后遇到类似主题时，RAG 不只召回原始文档，也能召回历史优化经验。
 
 
 
@@ -276,11 +450,265 @@ Anthropic 官网，github 等地方
 # 重点
 上述是准备 AI 的全量知识，我希望把重点放在下面三个上，到时候方便面试集中精力
 
+
 ## 如何解决 AI 幻觉问题，提升文章生成质量
-+ 提升召回率、精准度（提升 RAG 质量），比如双路召回
-+ 解决幻觉问题（针对没有检索出来或者检索出来的文本和训练知识互斥怎么办？）
-+ 提升生成质量（提升文章的忠实度和正相关性）
-+ 结合监控 Langfuse 如何做到监控上述指标，以及全链路监控，包括但不限于召回率，精准度，文章的忠实度和正相关性以及 token 使用数量、经费以及 AI 回答的时间以及 Rag 和 agent 消耗时长以及 token 数等。
+
+### 结合当前项目的整体链路
+当前项目是一个 SEO 文章生成 RAG 系统，核心链路是：
+
+1. 用户上传 PDF / MD / TXT / DOCX 文档。
+2. `DocumentProcessor` 解析文档文本。
+3. `TextChunker` 使用 `RecursiveCharacterTextSplitter` 切块，当前配置是 `chunk_size=512`，`chunk_overlap=128`，分隔符包含段落、换行、中文句号、感叹号、问号等。
+4. `EmbeddingService` 使用 `BAAI/bge-small-zh-v1.5` 生成 512 维向量。
+5. `VectorStore` 同时写入 Milvus 和 Elasticsearch：
+   - Milvus 存向量，用于语义召回。
+   - Elasticsearch 存全文，用于关键词召回。
+   - 按 `collection_name + tenant_id` 做物理隔离，避免不同租户知识混淆。
+6. 查询时 `RetrievalEngine` 做双路召回：
+   - Milvus：向量相似度召回，适合语义相近但关键词不完全一致的问题。
+   - Elasticsearch：全文召回，适合精确词、品牌词、术语、型号等关键词。
+7. `RerankService` 使用 FlashRank 多语言重排模型，把两路候选统一重排，最终返回 Top-K。
+8. `SEOWorkflow` 使用 LangGraph 编排：
+   - `retrieve_rag` 检索知识库。
+   - `search_serp` 调用 SerpAPI 获取实时网页信息。
+   - `generate_titles` 生成标题。
+   - 用户选择标题后 `generate_outlines` 生成大纲。
+   - 用户选择大纲后 `generate_article` 生成文章。
+
+面试表达：我不是直接把用户问题丢给大模型，而是先用 RAG 和搜索引擎构造可信上下文，再让模型在上下文范围内生成，减少模型凭空编造。
+
+### 提升召回率和精准度
+
+#### 1. 双路召回
+当前项目用了 Milvus + Elasticsearch 的双路召回：
+
+- 向量召回解决“语义相似但表达不同”的问题，比如用户问“如何降低 AI 编造内容”，知识库写的是“幻觉治理”。
+- 全文召回解决“关键词必须命中”的问题，比如品牌名、产品型号、专有名词、法规条款。
+- 两路召回的分数体系不同，所以项目里没有直接按原始分数排序，而是先合并去重，再交给 FlashRank 重排。
+
+面试表达：向量召回偏 recall，关键词召回偏 precision，重排负责最终相关性排序。
+
+#### 2. 切块策略
+当前项目使用 512 字符左右的 chunk，128 overlap。这样做的原因：
+
+- chunk 太大：召回粒度粗，容易把无关内容一起塞给模型，降低答案忠实度。
+- chunk 太小：上下文不完整，模型拿不到完整因果关系，容易断章取义。
+- overlap 可以缓解句子、段落被切断的问题，让跨段信息在相邻 chunk 中保留。
+
+后续可以优化：
+
+- 按标题、段落、Markdown 层级做结构化切块，而不是只按字符切。
+- 在 metadata 里记录 `doc_id`、`section_title`、`page_number`、`chunk_id`，方便答案溯源。
+- 对 SEO 文档可以按“标题、问题、解决方案、结论”做语义切块，提高文章生成时的上下文完整性。
+
+#### 3. Embedding 选型
+当前项目使用 `BAAI/bge-small-zh-v1.5`，适合中文语义检索，维度 512，速度和成本较低。
+
+选型时重点看：
+
+- 是否适合中文。
+- 向量维度和存储成本。
+- 召回效果，最好用自己的业务数据评测，而不是只看榜单。
+- 是否需要多语言，如果中英文混合，就考虑 bge-m3、multilingual-e5 等模型。
+
+面试表达：Embedding 不是越大越好，业务中要在召回效果、推理速度、存储成本之间平衡。
+
+#### 4. Query 改写
+当前项目的生成链路里，RAG 查询是 `topic + keywords`。这是简单有效的第一版，但还有提升空间：
+
+- 同义词扩展：把“幻觉”扩展为“编造、事实错误、不忠实、hallucination”。
+- 多查询改写：把一个问题拆成多个检索 query，例如“召回率怎么提升”“RAG 如何防幻觉”“文章忠实度怎么评估”。
+- HyDE：先让模型生成一个理想答案草稿，再用草稿做向量检索，提升语义召回。
+- 意图拆解：把用户想生成 SEO 文章的需求拆成“主题背景、用户痛点、解决方案、竞品信息、FAQ”等多个检索方向。
+
+面试表达：Query 改写的目标不是让问题变长，而是让检索 query 更接近知识库中的表达方式，提高召回率和覆盖面。
+
+### 解决 AI 幻觉
+
+#### 1. 没有检索结果怎么办
+如果 RAG 没有召回有效内容，不能让模型自由发挥。应该做降级：
+
+- 明确告诉模型“知识库未检索到相关内容，不要编造事实”。
+- 允许模型只输出通用建议，但要标注“非知识库依据”。
+- 触发 SerpAPI 网络搜索，用实时网页补充。
+- 对关键业务场景返回“缺少资料，请补充文档”，而不是生成看似完整但不可靠的内容。
+
+当前项目里 `_format_rag()` 在没有 RAG 内容时会返回“（无）”，这可以继续加强：在 prompt 中明确要求模型遇到“（无）”时不要伪造知识库事实。
+
+#### 2. 检索内容和模型知识冲突怎么办
+如果检索内容与模型预训练知识冲突，优先级应该是：
+
+1. 用户上传的知识库。
+2. 实时搜索结果。
+3. 模型自身知识。
+
+原因是知识库通常代表企业内部事实、产品规则或最新资料。面试时可以说：我的策略是“上下文优先”，模型只负责语言组织和推理，不让它覆盖业务事实。
+
+可落地做法：
+
+- Prompt 里写清楚“必须优先依据 knowledgeBase，不得使用与 knowledgeBase 冲突的信息”。
+- 生成后做事实一致性校验，让模型逐条检查文章中的关键事实是否能在 RAG 或网页结果中找到依据。
+- 对没有依据的句子打标或删除。
+- 输出引用来源，比如 chunk_id、文件名、网页链接，方便人工复核。
+
+#### 3. 限制模型自由发挥
+当前项目已经做了几件事：
+
+- 标题和大纲阶段要求模型返回 JSON，降低格式漂移。
+- 文章阶段把 `knowledgeBase` 和 `web_info` 单独传入 prompt。
+- 通过 LangGraph 拆成标题、大纲、文章三个阶段，并在标题和大纲处加入人工选择，减少一次性生成导致的方向偏差。
+
+还可以增强：
+
+- 在系统 prompt 中加入“只能基于参考资料回答；没有依据要说明无法确认”。
+- 要求模型输出“事实来源映射”，例如每段对应哪些 chunk。
+- 对文章做二次校验：相关性、忠实度、是否包含无依据事实。
+
+### 提升文章生成质量
+
+当前项目不是一次性生成文章，而是三阶段生成：
+
+1. 先生成 5 个标题，让用户选择方向。
+2. 再生成 3 套大纲，让用户选择结构。
+3. 最后按选定大纲生成完整文章。
+
+这样做的好处：
+
+- 降低长文本一次生成的不确定性。
+- 用户可以在关键决策点介入，避免文章跑偏。
+- 标题、大纲、正文分别优化，更符合 SEO 内容生产流程。
+
+文章质量可以从四个维度提升：
+
+- 忠实度：内容是否能被知识库或网页搜索结果支持。
+- 相关性：是否紧扣 topic、keywords 和用户意图。
+- 结构性：标题、大纲、段落是否符合 SEO 文章结构。
+- 可读性：语言是否自然、信息是否完整、是否有重复和空话。
+
+可扩展实现：
+
+- 生成后增加 evaluator 节点，对文章进行评分。
+- 使用 LLM-as-a-Judge 检查“是否忠实于 RAG 上下文”。
+- 对低分文章自动触发重写，重写时只修改问题段落。
+- 加入引用和来源，让文章可追溯。
+
+### Langfuse 如何做全链路监控
+
+当前项目还没有真正接入 Langfuse，但可以作为下一步可观测性建设。Langfuse 适合记录 LLM 调用、RAG 检索、Agent/DAG 节点耗时、token、成本、评分等。
+
+#### 1. Trace 设计
+一次文章生成用一个 trace，对应一个 `thread_id`：
+
+- trace name：`seo_article_generation`
+- user_id：`tenant_id`
+- session_id：`thread_id`
+- metadata：`topic`、`keywords`、`collection_name`、`llm_provider`
+
+#### 2. Span 设计
+每个关键步骤记录一个 span：
+
+- `document_parse`：文档解析耗时、文件类型、文本长度。
+- `chunking`：chunk 数量、chunk_size、chunk_overlap。
+- `embedding`：embedding 模型、向量维度、耗时。
+- `milvus_search`：召回数量、top score、耗时。
+- `es_search`：召回数量、top score、耗时。
+- `rerank`：候选数量、Top-K、rerank_score、耗时。
+- `serp_search`：搜索结果数量、抓取成功率、耗时。
+- `generate_titles`：输入 token、输出 token、耗时、模型、费用。
+- `generate_outlines`：输入 token、输出 token、耗时、模型、费用。
+- `generate_article`：输入 token、输出 token、耗时、模型、费用。
+
+#### 3. 监控指标
+RAG 指标：
+
+- recall 命中率：人工标注答案所需 chunk 是否被召回。
+- precision：Top-K 中真正相关 chunk 的比例。
+- MRR / NDCG：相关 chunk 排名是否靠前。
+- empty retrieval rate：无召回比例。
+- rerank 前后相关性提升。
+
+生成指标：
+
+- faithfulness：文章事实是否被 RAG / SERP 支持。
+- relevance：是否围绕 topic 和 keywords。
+- groundedness：每段是否能找到依据。
+- format correctness：JSON 或 Markdown 格式是否稳定。
+- human acceptance rate：用户是否接受标题、大纲、文章。
+
+成本和性能指标：
+
+- 每次生成的输入 / 输出 token。
+- 每个模型的调用次数和费用。
+- RAG 检索耗时、SerpAPI 耗时、LLM 生成耗时。
+- 端到端耗时。
+- 不同模型（DeepSeek / 通义千问 / 豆包）的质量、成本、延迟对比。
+
+#### 4. 面试表达
+可以这样回答：
+
+我会把一次文章生成看作一个 trace，把 RAG 检索、Serp 搜索、标题生成、大纲生成、正文生成都作为 span。这样不仅能看到最终文章质量，还能定位问题来自哪里：是召回阶段没召回，还是重排把相关内容排低了，还是 prompt 没约束好，还是模型本身生成质量差。对于 RAG 系统，不能只看最终回答，要把检索质量、上下文质量、生成质量和成本延迟全部串起来看。
+
+### 当前项目已经落地的优化点
+
+#### 1. Query Rewrite + 多查询召回
+原来项目只用 `topic + keywords` 做一次检索，现在在 LangGraph 中增加了 `rewrite_query` 节点：
+
+- 先让 LLM 根据主题和关键词生成 3-5 个检索 query。
+- 每个 query 分别走 Milvus + Elasticsearch 双路召回。
+- 合并所有候选 chunk，并按文本去重。
+- 最后仍然用原始 query 作为主意图，通过 FlashRank 做统一重排。
+
+面试表达：
+
+以前是单 query 检索，容易因为用户表达和知识库表达不一致导致漏召回。现在我在 RAG 前面加了一层 query rewrite，把主题拆成多个检索角度，再做多查询召回，可以提升召回覆盖率；同时最后统一 rerank，避免召回变多以后引入太多噪声。
+
+#### 2. Citation 溯源
+生成文章时，项目现在会把 RAG 和网页搜索结果格式化为带编号的上下文：
+
+- 知识库来源：`[KB1]`、`[KB2]`，包含文件名、chunk_id、matched_query。
+- 网页来源：`[WEB1]`、`[WEB2]`，包含标题和链接。
+- Prompt 中要求模型对关键事实尽量标注 `[KBx]` 或 `[WEBx]`。
+- `/api/generate/article` 接口会额外返回 `citations`，前端会展示引用来源和内容预览。
+
+面试表达：
+
+我不只生成文章，还把生成依据一起返回。这样文章里的事实可以追溯到知识库 chunk 或网页链接，方便人工复核，也能减少模型把无依据内容写成事实。
+
+#### 3. 生成后质量评估
+文章生成后，LangGraph 会继续执行 `quality_check` 节点，对文章做 LLM-as-a-Judge 评估：
+
+- `faithfulness`：是否忠实于 RAG / SERP 参考资料。
+- `relevance`：是否围绕 topic 和 keywords。
+- `structure`：是否符合 SEO 文章结构。
+- `citation_coverage`：关键事实是否有来源标注。
+- `overall`：综合分。
+- `risks` / `suggestions`：风险和改进建议。
+
+接口会返回 `quality_report`，前端会展示质量分、风险和建议。
+
+面试表达：
+
+我没有把生成结果当成最终答案直接交付，而是在生成后加了质量评估节点。这样可以量化文章质量，也能定位问题是忠实度不够、相关性不够、结构不好，还是引用覆盖不足。
+
+#### 4. 前端可观测展示
+生成文章后，前端会展示：
+
+- Query 改写结果。
+- 质量评估分数。
+- 风险和建议。
+- 引用来源列表。
+
+面试表达：
+
+这部分是为了让 RAG 链路可解释。面试或演示时，我可以直接展示：用户输入主题后，系统改写了哪些 query、召回了哪些知识、文章用了哪些来源、最终质量评分是多少。
+
+### 下一步可以继续优化
+
+- 接入 Langfuse，把 query rewrite、Milvus 检索、ES 检索、rerank、SerpAPI、LLM 生成、质量评估都记录为 trace / span。
+- 增加自动重写机制：如果 `quality_report.overall` 或 `faithfulness` 低于阈值，自动带着评估建议重写文章。
+- 优化 Elasticsearch 中文分词，当前使用 standard analyzer，对中文关键词检索不是最优，可以考虑 IK 分词或内置中文分析方案。
+- 优化切块策略，按标题和段落结构切块，提高上下文完整性。
+- 增加离线评测集，定期评估召回率、精确率、重排效果和生成质量。
 
 ## 多Agent 设计
 + 如何定义 每个 Agent 的边界和能力

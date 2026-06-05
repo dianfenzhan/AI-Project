@@ -82,6 +82,74 @@
           复制文章
         </el-button>
       </div>
+
+      <!-- RAG 可观测结果 -->
+      <div v-if="article" class="section">
+        <h3>RAG 质量与溯源</h3>
+        <el-card>
+          <h4>Query 改写</h4>
+          <el-tag
+            v-for="query in rewrittenQueries"
+            :key="query"
+            class="query-tag"
+            type="info"
+          >
+            {{ query }}
+          </el-tag>
+
+          <h4>质量评估</h4>
+          <el-descriptions v-if="qualityReport" :column="2" border>
+            <el-descriptions-item label="忠实度">
+              {{ displayScore(qualityReport.faithfulness) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="相关性">
+              {{ displayScore(qualityReport.relevance) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="结构性">
+              {{ displayScore(qualityReport.structure) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="引用覆盖">
+              {{ displayScore(qualityReport.citation_coverage) }}
+            </el-descriptions-item>
+            <el-descriptions-item label="综合分">
+              {{ displayScore(qualityReport.overall) }}
+            </el-descriptions-item>
+          </el-descriptions>
+
+          <div v-if="qualityReport?.risks?.length" class="quality-list">
+            <strong>风险：</strong>
+            <ul>
+              <li v-for="risk in qualityReport.risks" :key="risk">{{ risk }}</li>
+            </ul>
+          </div>
+
+          <div v-if="qualityReport?.suggestions?.length" class="quality-list">
+            <strong>建议：</strong>
+            <ul>
+              <li v-for="suggestion in qualityReport.suggestions" :key="suggestion">
+                {{ suggestion }}
+              </li>
+            </ul>
+          </div>
+
+          <h4>引用来源</h4>
+          <el-table :data="citations" size="small" style="width: 100%">
+            <el-table-column prop="id" label="编号" width="80" />
+            <el-table-column prop="type" label="类型" width="140" />
+            <el-table-column label="来源">
+              <template #default="{ row }">
+                <span v-if="row.type === 'knowledge_base'">
+                  {{ row.filename || '-' }} / chunk {{ row.chunk_id ?? '-' }}
+                </span>
+                <a v-else :href="row.link" target="_blank" rel="noreferrer">
+                  {{ row.title || row.link }}
+                </a>
+              </template>
+            </el-table-column>
+            <el-table-column prop="text_preview" label="内容预览" />
+          </el-table>
+        </el-card>
+      </div>
     </el-card>
   </div>
 </template>
@@ -106,6 +174,9 @@ const threadId = ref('')
 const titles = ref([])
 const outlines = ref([])
 const article = ref('')
+const rewrittenQueries = ref([])
+const citations = ref([])
+const qualityReport = ref(null)
 const selectedTitle = ref('')
 const selectedOutline = ref('')
 
@@ -114,6 +185,9 @@ const resetAfterTopicChange = () => {
   titles.value = []
   outlines.value = []
   article.value = ''
+  rewrittenQueries.value = []
+  citations.value = []
+  qualityReport.value = null
   selectedTitle.value = ''
   selectedOutline.value = ''
 }
@@ -159,6 +233,9 @@ const handleGenerateOutlines = async () => {
 
   loadingOutlines.value = true
   article.value = ''
+  rewrittenQueries.value = []
+  citations.value = []
+  qualityReport.value = null
   selectedOutline.value = ''
   try {
     const params = {
@@ -194,6 +271,9 @@ const handleGenerateArticle = async () => {
     }
     const response = await axios.post('/api/v1/generate/article', null, { params })
     article.value = response.data.article || ''
+    rewrittenQueries.value = response.data.rewritten_queries || []
+    citations.value = response.data.citations || []
+    qualityReport.value = response.data.quality_report || null
     ElMessage.success('文章生成成功')
   } catch (error) {
     ElMessage.error('生成文章失败: ' + (error.response?.data?.message || error.message))
@@ -209,6 +289,13 @@ const copyArticle = () => {
   }
   navigator.clipboard.writeText(article.value)
   ElMessage.success('已复制到剪贴板')
+}
+
+const displayScore = (score) => {
+  if (score === null || score === undefined) {
+    return '未评估'
+  }
+  return `${score}/100`
 }
 </script>
 
@@ -245,6 +332,14 @@ const copyArticle = () => {
   line-height: 1.8;
   font-size: 16px;
   margin: 0;
+}
+
+.query-tag {
+  margin: 0 8px 8px 0;
+}
+
+.quality-list {
+  margin-top: 16px;
 }
 
 pre {

@@ -37,8 +37,7 @@
 │   └── src/
 │       ├── views/
 │       └── router/
-├── docker-compose.yml        # Milvus + ES 服务
-└── docker-compose-postgres.yml # PostgreSQL 服务
+└── docker-compose.yml        # PostgreSQL + Milvus + ES + Kibana
 ```
 
 ## 快速开始
@@ -47,41 +46,38 @@
 
 建议按下面顺序启动：先启动数据库和检索组件，再启动 Python RAG/DAG 服务，然后启动 Java 网关，最后启动 Vue 前端。
 
-#### 1. 启动 PostgreSQL
-
-```bash
-docker compose -f docker-compose-postgres.yml up -d
-```
-
-#### 2. 启动 Milvus + Elasticsearch + Kibana
+#### 1. 启动基础服务（PostgreSQL + Milvus + Elasticsearch + Kibana）
 
 ```bash
 docker compose up -d
 ```
 
-#### 3. 安装 Python 依赖
+#### 2. 安装 Python 依赖
 
-建议在项目根目录创建虚拟环境，然后进入 Python 项目安装依赖（避免 macOS 上 `pip` / `No module named pip` 问题）：
+需要 **Python 3.11+**（推荐 Homebrew 安装：`brew install python@3.11`）。在 `python/` 目录下创建虚拟环境并安装依赖：
 
 ```bash
-cd /path/to/Project-Self
+cd /path/to/Project-Self/python
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-cd python
+source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 ```
 
-若提示 `No module named pip`，先执行 `python3 -m ensurepip --upgrade`，或重装 Python：`brew reinstall python@3.11`。
+首次安装会下载 `sentence-transformers`、`flashrank` 等较大依赖（含 PyTorch），可能需要几分钟。
 
-#### 4. 启动 Python API 服务
+若提示 `No module named pip`，先执行 `python3 -m ensurepip --upgrade`；若仍失败，可重装 Python：`brew reinstall python@3.11`。
+
+#### 3. 启动 Python API 服务
+
+必须在 `python/` 目录下启动（代码使用 `from RAG import ...` 相对导入）：
 
 ```bash
-# 若使用了虚拟环境，先 source .venv/bin/activate
-cd python
+cd /path/to/Project-Self/python
+source .venv/bin/activate   # 新终端需要先激活虚拟环境
 python3 api_server.py
 ```
 
-#### 5. 启动 Java 后端
+#### 4. 启动 Java 后端
 
 新开一个终端：
 
@@ -90,7 +86,7 @@ cd java
 mvn spring-boot:run
 ```
 
-#### 6. 启动前端
+#### 5. 启动前端
 
 新开一个终端：
 
@@ -102,13 +98,24 @@ npm run dev
 
 ### 访问地址
 
-- 前端 UI: `http://localhost:5173`
-- Java 后端: `http://localhost:8080`
-- Python API: `http://localhost:8000`
-- Elasticsearch: `http://localhost:9200`
-- Kibana: `http://localhost:5601`
-- Milvus: `localhost:19530`
-- PostgreSQL: `localhost:5432`
+> 下面括号中是服务名，真实访问地址仍以冒号后的端口为准；不要直接把服务名拼到 URL 后面，否则服务未配置 context path 时会 404。
+
+- 前端 UI（`seo-frontend`）: `http://localhost:5173`
+- Java 后端（`seo-java`）: `http://localhost:8080`
+- Python API（`seo-python`）: `http://localhost:8000`
+- Elasticsearch（`seo-elasticsearch`）: `http://localhost:9200`
+- Kibana（`seo-kibana`）: `http://localhost:5601`
+- Milvus（`seo-milvus`）: `localhost:19530`
+- PostgreSQL（`seo-postgres`）: `localhost:5432`
+
+### API 文档（Swagger）
+
+| 服务 | Swagger UI | OpenAPI JSON |
+|------|-----------|--------------|
+| Java 网关 | `http://localhost:8080/swagger-ui/index.html` | `http://localhost:8080/v3/api-docs` |
+| Python RAG/DAG | `http://localhost:8000/docs` | `http://localhost:8000/openapi.json` |
+
+Python 服务还提供 ReDoc 文档：`http://localhost:8000/redoc`
 
 ### 推荐验证流程
 
@@ -128,7 +135,6 @@ npm run dev
 
 ```bash
 docker compose down
-docker compose -f docker-compose-postgres.yml down
 ```
 
 Python API、Java 后端、前端开发服务在各自终端按 `Ctrl+C` 停止。
@@ -137,7 +143,7 @@ Python API、Java 后端、前端开发服务在各自终端按 `Ctrl+C` 停止�
 
 ### 1. 文档上传与索引
 - 支持 PDF、MD、TXT、DOCX 格式
-- 语义切块（512 tokens，128 overlap）
+- 语义切块（512 字符左右，128 overlap）
 - 向量化存储到 Milvus
 - 全文索引到 Elasticsearch
 - 租户隔离
@@ -145,6 +151,7 @@ Python API、Java 后端、前端开发服务在各自终端按 `Ctrl+C` 停止�
 ### 2. 双路召回与重排序
 - 向量检索（Milvus）
 - 全文检索（Elasticsearch）
+- Query 改写 + 多查询召回，提升召回覆盖率
 - FlashRank 重排序
 - Top 10 结果返回
 
@@ -159,6 +166,11 @@ Python API、Java 后端、前端开发服务在各自终端按 `Ctrl+C` 停止�
 - 根据选定大纲生成完整文章
 - 可切换 AI 模型（DeepSeek / 通义千问 / 豆包）
 - 使用 LangGraph 中断恢复（human-in-the-loop）实现三步交互
+
+### 5. RAG 质量与溯源
+- 文章生成后返回 `quality_report`，评估忠实度、相关性、结构性和引用覆盖率
+- 返回 `citations`，可追溯到知识库 chunk 或网页搜索结果
+- 前端生成页展示 query 改写结果、质量评分、风险建议和引用来源
 
 ## API 接口
 
@@ -175,7 +187,7 @@ Python API、Java 后端、前端开发服务在各自终端按 `Ctrl+C` 停止�
 - `POST /api/search` - 双路召回搜索
 - `POST /api/generate/titles` - 第一阶段生成标题（返回 thread_id）
 - `POST /api/generate/outlines` - 第二阶段生成大纲（需传 thread_id + selected_title）
-- `POST /api/generate/article` - 第三阶段生成文章（需传 thread_id + selected_outline）
+- `POST /api/generate/article` - 第三阶段生成文章，并返回质量评估和引用来源（需传 thread_id + selected_outline）
 
 ### 前端 (5173端口)
 - `/upload` - 文档上传页面

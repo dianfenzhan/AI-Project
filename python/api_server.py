@@ -12,7 +12,14 @@ from RAG import (
 from DAG import SEOWorkflow
 
 
-app = FastAPI(title="SEO RAG API")
+app = FastAPI(
+    title="SEO RAG API",
+    description="Python RAG/DAG 服务：文档索引、双路召回搜索、三步 SEO 文章生成",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,7 +60,7 @@ class ChooseOutlineRequest(BaseModel):
     selected_outline: str
 
 
-@app.post("/api/upload")
+@app.post("/api/upload", tags=["RAG"])
 async def upload_document(
     file: UploadFile = File(...),
     tenant_id: str = Form("default"),
@@ -84,7 +91,7 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/search")
+@app.post("/api/search", tags=["RAG"])
 async def search(request: SearchRequest):
     """双路召回 + 重排，返回 Top-K。"""
     try:
@@ -97,7 +104,7 @@ async def search(request: SearchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/generate/titles")
+@app.post("/api/generate/titles", tags=["文章生成"])
 async def generate_titles(request: GenerateStartRequest):
     """第一步：基于 RAG + SerpAPI 生成 5 个标题，返回 thread_id 用于后续步骤。"""
     try:
@@ -115,7 +122,7 @@ async def generate_titles(request: GenerateStartRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/generate/outlines")
+@app.post("/api/generate/outlines", tags=["文章生成"])
 async def generate_outlines(request: ChooseTitleRequest):
     """第二步：用户选定标题后，生成 3 套大纲。"""
     try:
@@ -125,12 +132,12 @@ async def generate_outlines(request: ChooseTitleRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/generate/article")
+@app.post("/api/generate/article", tags=["文章生成"])
 async def generate_article(request: ChooseOutlineRequest):
     """第三步：用户选定大纲后，生成完整文章。"""
     try:
-        article = seo_workflow.choose_outline(request.thread_id, request.selected_outline)
-        return {"status": "success", "thread_id": request.thread_id, "article": article}
+        result = seo_workflow.choose_outline(request.thread_id, request.selected_outline)
+        return {"status": "success", "thread_id": request.thread_id, **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

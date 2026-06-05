@@ -2,7 +2,6 @@ langchain==0.3.3
 langchain-openai==0.2.3
 langchain-community==0.3.2
 langgraph==0.2.39
-langfuse==2.63.0
 pymilvus==2.5.2
 elasticsearch==8.15.0
 sentence-transformers==3.1.1
