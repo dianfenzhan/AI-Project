@@ -5,67 +5,73 @@ from .embedding import EmbeddingService
 
 
 class RetrievalEngine:
-    """双路召回：Milvus 向量检索 + Elasticsearch 全文检索，合并去重后交给重排。"""
+    """双路召回 + RRF 融合 + 两级权限。
+
+    召回来源：
+    - 租户级集合（仅当前 tenant 可见）
+    - 系统级集合（所有租户共享）
+
+    每个来源都做 Milvus 向量召回 + Elasticsearch 全文召回，共最多 4 路 ranked list；
+    用 RRF（Reciprocal Rank Fusion）按排名融合，输出排序更合理的候选集，再交给 rerank。
+
+    权限控制：检索只会访问「当前租户集合」+「系统级集合」，绝不会读到其他租户的数据。
+    """
 
     def __init__(self, vector_store: VectorStore):
         self.vector_store = vector_store
         self.embedding_service = vector_store.embedding_service
         self.recall_top_k = Config.RECALL_TOP_K
+        self.rrf_k = Config.RRF_K
 
     def hybrid_search(self, query: str, collection_name: str, tenant_id: str = "default") -> List[Dict[str, Any]]:
-        self.vector_store.load_collection(collection_name, tenant_id)
-
         query_embedding = self.embedding_service.embed_text(query)
 
-        milvus_results = self._search_milvus(query_embedding)
-        es_results = self._search_es(query)
+        # 允许访问的 scope：当前租户 + 系统级（共享）
+        scopes = [
+            (tenant_id, Config.SCOPE_TENANT),
+            (Config.SYSTEM_TENANT_ID, Config.SCOPE_SYSTEM),
+        ]
 
-        return self._merge_results(milvus_results, es_results)
+        ranked_lists: List[List[Dict[str, Any]]] = []
+        for store_tenant_id, scope in scopes:
+            milvus_docs = self.vector_store.search_milvus(
+                query_embedding, collection_name, store_tenant_id, self.recall_top_k
+            )
+            es_docs = self.vector_store.search_es(
+                query, collection_name, store_tenant_id, self.recall_top_k
+            )
+            for doc in milvus_docs + es_docs:
+                doc.setdefault("metadata", {})
+                if doc["metadata"] is None:
+                    doc["metadata"] = {}
+                doc["metadata"]["access_scope"] = scope
+            if milvus_docs:
+                ranked_lists.append(milvus_docs)
+            if es_docs:
+                ranked_lists.append(es_docs)
 
-    def _search_milvus(self, query_embedding: List[float]) -> List[Dict[str, Any]]:
-        search_params = {"metric_type": "COSINE", "params": {"nprobe": 10}}
-        results = self.vector_store.milvus_collection.search(
-            data=[query_embedding],
-            anns_field="embedding",
-            param=search_params,
-            limit=self.recall_top_k,
-            output_fields=["text", "metadata"],
-        )
+        return self._rrf_fuse(ranked_lists)
 
-        docs = []
-        for hit in results[0]:
-            docs.append({
-                "text": hit.entity.get("text"),
-                "metadata": hit.entity.get("metadata"),
-                "score": float(hit.score),
-                "source": "milvus",
-            })
-        return docs
+    def _rrf_fuse(self, ranked_lists: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """Reciprocal Rank Fusion：对每个 ranked list，按 rank 累加 1/(K + rank)。
 
-    def _search_es(self, query: str) -> List[Dict[str, Any]]:
-        results = self.vector_store.es_client.search(
-            index=self.vector_store.es_index,
-            query={"match": {"text": query}},
-            size=self.recall_top_k,
-        )
+        不同检索系统的原始分数量纲不同（Milvus 余弦 vs ES BM25），直接相加不合理；
+        RRF 只依赖「排名」，对量纲不敏感，是工程上常用且稳健的多路融合方法。
+        """
+        fused: Dict[str, Dict[str, Any]] = {}
+        for ranked in ranked_lists:
+            for rank, doc in enumerate(ranked, start=1):
+                text = doc.get("text")
+                if not text:
+                    continue
+                contribution = 1.0 / (self.rrf_k + rank)
+                if text not in fused:
+                    merged = dict(doc)
+                    merged["rrf_score"] = contribution
+                    merged["sources"] = [doc.get("source")]
+                    fused[text] = merged
+                else:
+                    fused[text]["rrf_score"] += contribution
+                    fused[text]["sources"].append(doc.get("source"))
 
-        docs = []
-        for hit in results["hits"]["hits"]:
-            docs.append({
-                "text": hit["_source"]["text"],
-                "metadata": hit["_source"].get("metadata", {}),
-                "score": float(hit["_score"]),
-                "source": "elasticsearch",
-            })
-        return docs
-
-    def _merge_results(self, milvus_docs: List[Dict], es_docs: List[Dict]) -> List[Dict]:
-        # 两路分数量纲不同，这里只做去重合并，真正的排序交给后续 rerank
-        seen_texts = set()
-        combined = []
-        for doc in milvus_docs + es_docs:
-            text = doc["text"]
-            if text and text not in seen_texts:
-                seen_texts.add(text)
-                combined.append(doc)
-        return combined
+        return sorted(fused.values(), key=lambda d: d["rrf_score"], reverse=True)

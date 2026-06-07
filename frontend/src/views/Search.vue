@@ -1,19 +1,7 @@
 <template>
   <div class="search-page">
-    <el-card class="search-card">
-      <template #header>
-        <div class="card-header">
-          <span>知识库搜索</span>
-        </div>
-      </template>
-      
+    <el-card class="search-card" shadow="never">
       <el-form :model="form" label-width="120px">
-        <el-form-item label="租户ID">
-          <el-input v-model="form.tenantId" placeholder="请输入租户ID" />
-        </el-form-item>
-        <el-form-item label="集合名称">
-          <el-input v-model="form.collectionName" placeholder="请输入集合名称" />
-        </el-form-item>
         <el-form-item label="搜索内容">
           <el-input v-model="form.query" placeholder="请输入搜索内容" />
         </el-form-item>
@@ -26,13 +14,24 @@
       
       <div v-if="results.length > 0" class="search-results">
         <h3>搜索结果 (Top {{ results.length }})</h3>
+        <p class="scope-note">
+          检索范围：系统级共享库 + 当前租户「{{ props.tenantId }}」，不会返回其他租户的文档。
+        </p>
         <el-divider />
         <div v-for="(result, index) in results" :key="index" class="result-item">
           <el-card shadow="hover">
             <div class="result-meta">
-              <el-tag :type="result.source === 'milvus' ? 'primary' : 'success'">
-                {{ result.source }}
-              </el-tag>
+              <div class="tags">
+                <el-tag :type="result.source === 'milvus' ? 'primary' : 'success'">
+                  {{ result.source }}
+                </el-tag>
+                <el-tag
+                  :type="scopeOf(result) === 'system' ? 'warning' : 'info'"
+                  effect="plain"
+                >
+                  {{ scopeOf(result) === 'system' ? '系统级' : '租户级' }}
+                </el-tag>
+              </div>
               <span class="score">Score: {{ result.rerank_score?.toFixed(4) || result.score?.toFixed(4) }}</span>
             </div>
             <p>{{ result.text }}</p>
@@ -48,14 +47,17 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
 
-const form = ref({
-  tenantId: 'default',
-  collectionName: 'default',
-  query: ''
+const props = defineProps({
+  tenantId: { type: String, default: 'tenant_001' },
+  collectionName: { type: String, default: 'acme_kb' }
 })
+
+const form = ref({ query: '' })
 
 const loading = ref(false)
 const results = ref([])
+
+const scopeOf = (result) => result?.metadata?.access_scope || result?.metadata?.scope || 'tenant'
 
 const handleSearch = async () => {
   if (!form.value.query) {
@@ -67,8 +69,8 @@ const handleSearch = async () => {
   try {
     const params = {
       query: form.value.query,
-      tenantId: form.value.tenantId,
-      collectionName: form.value.collectionName
+      tenantId: props.tenantId,
+      collectionName: props.collectionName
     }
     const response = await axios.post('/api/v1/search', null, { params })
     results.value = response.data.results
@@ -85,8 +87,8 @@ const handleSearch = async () => {
 
 <style scoped>
 .search-page {
-  max-width: 900px;
-  margin: 0 auto;
+  max-width: 100%;
+  margin: 0;
 }
 
 .search-card {
@@ -111,6 +113,17 @@ const handleSearch = async () => {
   justify-content: space-between;
   margin-bottom: 10px;
   align-items: center;
+}
+
+.tags {
+  display: flex;
+  gap: 8px;
+}
+
+.scope-note {
+  color: #909399;
+  font-size: 13px;
+  margin: 4px 0 0;
 }
 
 .score {

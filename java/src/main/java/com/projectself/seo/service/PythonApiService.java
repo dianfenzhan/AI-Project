@@ -23,7 +23,7 @@ public class PythonApiService {
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
     
-    public JsonNode uploadDocument(MultipartFile file, String tenantId, String collectionName) throws Exception {
+    public JsonNode uploadDocument(MultipartFile file, String tenantId, String collectionName, String scope) throws Exception {
         String url = pythonApiBaseUrl + "/api/upload";
         
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
@@ -36,6 +36,7 @@ public class PythonApiService {
         body.add("file", fileResource);
         body.add("tenant_id", tenantId);
         body.add("collection_name", collectionName);
+        body.add("scope", scope);
         
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);

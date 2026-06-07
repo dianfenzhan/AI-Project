@@ -11,7 +11,7 @@ class RerankService:
     """
 
     def __init__(self):
-        # 使用多语言模型，保证中文文档的重排效果
+        # 出海英文内容，使用英文 cross-encoder（ms-marco-MiniLM）做重排
         self.ranker = Ranker(model_name=Config.RERANK_MODEL)
 
     def rerank(self, query: str, docs: List[Dict[str, Any]], top_k: int = None) -> List[Dict[str, Any]]:
@@ -23,7 +23,7 @@ class RerankService:
         # FlashRank 0.2.x 的正确用法：传入 RerankRequest，passages 为带 id/text 的字典列表
         passages = [{"id": idx, "text": doc["text"]} for idx, doc in enumerate(docs)]
         rerank_request = RerankRequest(query=query, passages=passages)
-        results = self.ranker.rank(rerank_request)
+        results = self.ranker.rerank(rerank_request)
 
         reranked_docs = []
         for res in results[:top_k]:

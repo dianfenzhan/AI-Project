@@ -1,0 +1,7 @@
+Acme SaaS SEO Guide
+
+The best practice for B2B SaaS landing pages is to use primary keywords in H1 tags.
+Internal linking improves crawl depth for enterprise software websites.
+Meta descriptions should stay under 160 characters for optimal click-through rate.
+
+Unique test token: ZETA-SEO-7742

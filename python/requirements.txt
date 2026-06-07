@@ -2,6 +2,7 @@ langchain==0.3.3
 langchain-openai==0.2.3
 langchain-community==0.3.2
 langgraph==0.2.39
+langgraph-checkpoint-sqlite==2.0.1
 pymilvus==2.5.2
 elasticsearch==8.15.0
 sentence-transformers==3.1.1
@@ -18,3 +19,14 @@ lxml==5.3.0
 requests==2.32.3
 numpy==1.26.4
 flashrank==0.2.8
+tiktoken==0.8.0
+
+# 可观测与评测（可选，未配置 key 时自动跳过）
+langfuse==2.53.9
+ragas==0.2.14
+datasets==2.21.0
+
+# PDF 处理：表格抽取 + 扫描件 OCR（OCR 还需本机安装 tesseract / poppler）
+pdfplumber==0.11.4
+pytesseract==0.3.13
+pdf2image==1.17.0

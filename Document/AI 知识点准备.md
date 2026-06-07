@@ -1,222 +1,120 @@
 # Rag
 
-## 面试总回答
+> 业务背景：出海营销公司，文章都是**英文**。所以 embedding 用英文模型、ES 用 english 分析器（不用中文 IK 分词）、所有生成 prompt 都要求英文输出。
 
-我当前项目里的 RAG 不是简单“向量库搜一下再交给大模型”，而是一个面向 SEO 文章生成的检索增强链路：
+## 整体链路（对照项目）
+文档上传 → 解析（PDF/MD/TXT/DOCX）→ 切块（tiktoken 控 token）→ 英文 embedding（bge-small-en-v1.5, 384 维）→ 同时写入 Milvus（向量）和 Elasticsearch（全文）→ 检索时 query 改写多路召回 → RRF 融合 → FlashRank 重排 → 交给 LangGraph 生成链路。
 
-1. 文档上传后，先解析 PDF / MD / TXT / DOCX。
-2. 使用 `RecursiveCharacterTextSplitter` 做切块，当前是 `chunk_size=512`、`chunk_overlap=128`。
-3. 使用 `BAAI/bge-small-zh-v1.5` 做中文 embedding，向量维度是 512。
-4. 同一批 chunk 同时写入 Milvus 和 Elasticsearch：
-   - Milvus 负责语义召回。
-   - Elasticsearch 负责关键词召回。
-5. 检索时先做 query rewrite，生成多个检索 query。
-6. 每个 query 都走 Milvus + Elasticsearch 双路召回。
-7. 多路结果合并去重后，使用 FlashRank 做 rerank，最终返回 Top-K 证据。
-8. 生成文章时把知识库证据和 SerpAPI 搜索结果一起传给 LLM，并返回 citations 和 quality_report。
+## 文档解析：PDF 三类处理（项目已实现）
+`DocumentProcessor` 对 PDF 分三类处理，所有可选依赖都 try-import，缺失时优雅降级、不影响主流程：
+1. **源文件 PDF（数字文本）**：`pypdf` 直接抽取文本层，最快最准。
+2. **扫描件 PDF（图片型）**：当 pypdf 抽到的文本长度低于阈值（判定为扫描件）时，用 `pdf2image` 渲染成图片 + `pytesseract` OCR（英文 `lang=eng`）。OCR 需本机装 tesseract（Mac: `brew install tesseract`）和 poppler，没装就提示并跳过。
+3. **带表格 PDF**：用 `pdfplumber` 抽取表格，转成 **Markdown 表格**追加到正文，保留行列结构，避免表格数据被拍平成乱序文本。
 
-一句话总结：
-
-> 我的 RAG 重点是提升召回覆盖率、控制生成幻觉、让文章内容可溯源。核心实现是 query rewrite + Milvus/ES 双路召回 + FlashRank 重排 + citation + 生成后质量评估。
+> 面试点：为什么要分三类——不同 PDF 的“文本可得性”不同，统一用 pypdf 会让扫描件抽出空文本、让表格丢结构；按类型路由能最大化信息保真度。
 
 ## 切块
+### 一期（项目当前实现）
+用 `RecursiveCharacterTextSplitter.from_tiktoken_encoder`，**按 token 数控制**，而不是固定字符数：
 
-### 当前项目怎么做
+- `chunk_size=512`（token），`chunk_overlap=128`（token）
+- 递归分隔符：段落 `\n\n` → 换行 `\n` → 句子 `. ? !` → 空格 → 字符
+- 每个 chunk 写入 metadata：`doc_id`、`chunk_id`，便于后续溯源
+- tiktoken 不可用时自动降级为按字符切，保证服务可启动
 
-当前项目使用 LangChain 的 `RecursiveCharacterTextSplitter` 切块：
+### 为什么是 512 / 128（面试重点）
+- **为什么 512 token**：512 token 大约是一个完整自然段落的语义单元。太大（比如 1024+）会把多个不相关主题塞进一个 chunk，召回后噪声多、稀释相关性、还浪费上下文 token；太小（比如 128）会把一个完整论述切碎，召回到的片段缺上下文，模型容易断章取义。512 是“语义完整”和“检索精度”的折中，也是社区常用默认值。
+- **为什么 128 overlap（约 25%）**：overlap 是为了解决切块边界把一句话/一个因果关系切断的问题。相邻 chunk 保留 128 token 重叠，能保证跨边界的信息在至少一个 chunk 里是完整的。25% 是经验上“防断裂”和“控制冗余存储”的平衡——再大就大量重复内容、浪费存储和召回名额。
+- **为什么用 token 而不是字符**：LLM 的上下文和计费都按 token，按 token 控制能精确预估“塞进上下文的成本”，也避免中英文/标点导致字符数与 token 数偏差。
 
-- `chunk_size=512`
-- `chunk_overlap=128`
-- 分隔符包含：段落、换行、中文句号、感叹号、问号、英文标点、空格等
-- 每个 chunk 会带上 metadata，例如 `filename`、`tenant_id`、`collection_name`、`chunk_id`
+### 二期（已预留接口 `structure_aware_chunk`）
+- 按标题、段落、Markdown 层级做结构化切块，而不是只按字符/token 切。
+- metadata 记录 `doc_id`、`section_title`、`page_number`、`chunk_id`，方便答案溯源。
+- 针对 SEO 文档按「标题、问题、解决方案、结论」做语义切块，提高生成时的上下文完整性。
 
-项目里现在是“字符长度控制”，不是 token 级控制。面试时不要说当前已经用了 tiktoken 控 token，否则和代码不一致。
-
-### 为什么要 overlap
-
-Overlap 是为了解决“切块边界导致语义断裂”的问题。
-
-比如一段话前半段讲问题，后半段讲解决方案，如果正好被切成两个 chunk，单独召回其中一个可能上下文不完整。设置 128 overlap 后，相邻 chunk 会保留一部分重复内容，能提高召回后的语义完整性。
-
-### 为什么用 RecursiveCharacterTextSplitter
-
-它会按优先级递归切分：
-
-1. 先按段落切。
-2. 段落太长再按换行切。
-3. 还太长再按句号、问号、感叹号切。
-4. 最后才按空格或字符切。
-
-这样比简单按固定长度截断更接近自然语言结构。
-
-### 面试回答
-
-切块的目标不是越细越好，而是在召回粒度和上下文完整性之间做平衡。我的项目里使用 `RecursiveCharacterTextSplitter`，按段落、换行、中文标点递归切分，当前 chunk size 是 512，overlap 是 128。这样既不会让 chunk 太大引入太多噪声，也不会太小导致语义不完整。后续如果文档结构更复杂，我会进一步按 Markdown 标题、章节、页面号做结构化切块。
-
-### 后续优化
-
-- 用 tiktoken 或模型 tokenizer 控制 token 数，而不是只控制字符数。
-- Markdown 文档按标题层级切块。
-- PDF 文档保留页码，便于 citation 溯源。
-- 对 FAQ、产品文档、SEO 方法论文档使用不同切块策略。
-- 增加 chunk 质量检查：空 chunk、重复 chunk、过长 chunk、无意义 chunk 不入库。
+## Embedding 维度为什么选 384（面试重点）
+- 项目用 `BAAI/bge-small-en-v1.5`，输出 **384 维**，是模型结构（small 版隐藏层维度）决定的，不是随便设的。
+- **维度的权衡**：维度越高（如 base=768、large=1024）通常表达能力更强、召回更准，但向量存储更大、检索更慢、内存更高；维度越低则更快更省，但语义区分度下降。
+- 选 small/384 的理由：英文语义检索效果已经够用，向量库占用小、检索快、本地开发友好；后续若召回不够，可平滑升级到 bge-base-en（768）或 bge-m3，只需改配置 + 重建集合（维度变了必须重建 Milvus collection）。
 
 ## 如何 query 改写
+### 项目实现
+LangGraph 里有 `rewrite_query` 节点：把 `topic + keywords` 交给 LLM，生成 3-5 个英文检索 query，覆盖主题背景、用户痛点、解决方案、FAQ 等角度。每个 query 都走一遍双路召回。
 
-### 当前项目怎么做
-
-当前项目已经在 LangGraph 里增加了 `rewrite_query` 节点。
-
-原始 query 是：
-
-```text
-topic + keywords
-```
-
-然后让 LLM 根据主题和关键词改写成 3-5 个中文检索 query，要求覆盖：
-
-- 主题背景
-- 用户痛点
-- 解决方案
-- FAQ
-- 不同 SEO 写作角度
-
-每个 query 都会走同一套 RAG 检索链路：
-
-```text
-query rewrite -> 多 query -> Milvus + Elasticsearch -> 合并去重 -> FlashRank rerank
-```
+### 去重（项目已实现）
+改写结果会做**规范化去重**：统一转小写 + 去首尾空白后判重，避免“同义不同写法”的 query 重复检索、浪费召回名额；最多保留 5 个。
 
 ### 为什么要 query 改写
-
-用户输入和知识库里的表达不一定一致。
-
-例如用户输入“AI 幻觉怎么解决”，知识库里可能写的是：
-
-- 事实一致性校验
-- 忠实度评估
-- groundedness
-- RAG 防编造
-- 引用溯源
-
-如果只用原始 query，可能漏召回。Query rewrite 的作用是把用户问题扩展成更贴近知识库表达的多个检索视角。
-
-### 面试回答
-
-我在 RAG 前面加了 query rewrite 节点，不是直接拿用户输入去搜。因为用户输入往往比较短，而且表达方式和知识库不一定一致。我的做法是让 LLM 先把 `topic + keywords` 改写成多个检索 query，覆盖背景、痛点、解决方案、FAQ 等角度，然后每个 query 都走 Milvus 和 Elasticsearch 双路召回。这样能提升 recall。为了避免召回变多后噪声变多，我最后会统一用 FlashRank rerank，只取 Top-K 证据进入生成阶段。
-
-### 和 prompt 模版的关系
-
-Prompt 模版主要控制“生成质量”，Query rewrite 主要控制“检索质量”。
-
-在我的项目里：
-
-- 标题、大纲、文章生成使用固定 prompt 结构，限制输出格式和内容方向。
-- Query rewrite 是在检索前发生，用来提升召回覆盖率。
-- 文章生成阶段再把 RAG 证据、网页搜索结果、用户选择的大纲一起交给 LLM。
-
-所以不能把 query rewrite 简单理解为“控制用户输入提示词”，它更像是 RAG 检索前的查询理解层。
-
-### 后续优化
-
-- 对 query rewrite 的结果做去重、黑名单过滤和长度限制。
-- 增加 HyDE：先生成一个假设答案，再用假设答案做向量检索。
-- 根据不同业务意图生成不同 query，例如产品介绍、FAQ、竞品对比、价格方案。
-- 记录每个 chunk 是被哪个 query 召回的，用于分析 query rewrite 是否有效。
+用户输入短、且表达方式和知识库不一致（用户说 “reduce AI making things up”，库里写 “hallucination / faithfulness”）。改写成多角度 query 能显著提升召回覆盖率（recall）。为了避免召回变多带来的噪声，后面用 RRF + rerank 收敛。
 
 ## 如何双路召回
+### 项目实现
+同一批 chunk 同时写入 Milvus（向量）和 ES（全文）：
+- Milvus：COSINE 向量召回，解决“语义相似但用词不同”。
+- ES：english 分析器全文召回，解决“关键词/术语/品牌精确命中”。
 
-### 当前项目怎么做
+### RRF 融合（项目已实现，替代“智能权重归一化”）
+两路（甚至跨 scope 共 4 路）召回的分数量纲不同（Milvus 余弦 vs ES BM25），**不能直接相加**。项目用 **RRF（Reciprocal Rank Fusion）**：每个 ranked list 里，第 rank 名贡献 `1 / (K + rank)`（K=60），多路分数相加得到融合分。RRF 只依赖“排名”，对量纲不敏感，工程上稳健、实现简单。融合后再交给 FlashRank cross-encoder 重排，最终取 Top-10。
 
-项目中上传文档后，同一批 chunk 会写入两个系统：
-
-- Milvus：存储 dense embedding，用 COSINE 相似度做语义检索。
-- Elasticsearch：存储 text 字段，用 `match` 查询做全文检索。
-
-检索时：
-
-1. 对 query 生成 embedding。
-2. Milvus 召回 Top 20。
-3. Elasticsearch 召回 Top 20。
-4. 两路结果按文本去重合并。
-5. 使用 FlashRank 对合并后的候选统一 rerank。
-6. 最终返回 Top 10。
-
-注意：当前项目没有做“智能权重 + 归一化融合”，而是先合并去重，再交给 rerank。这样说更贴合代码。
-
-### 为什么要双路召回
-
-Milvus 和 Elasticsearch 解决的问题不一样：
-
-- Milvus 适合语义相似召回，比如“幻觉治理”和“减少模型编造”。
-- Elasticsearch 适合关键词精确匹配，比如品牌名、术语、型号、政策条款。
-
-只用向量召回，可能丢掉关键词精确命中的内容；只用关键词召回，又可能召不回表达不同但语义相同的内容。所以两路结合更稳。
-
-### 为什么要 rerank
-
-Milvus 的向量分数和 Elasticsearch 的 `_score` 不在同一个量纲，不能简单相加或直接排序。
-
-当前项目选择：
-
-```text
-Milvus 候选 + ES 候选 -> 去重合并 -> FlashRank rerank -> Top-K
-```
-
-FlashRank 是 cross-encoder 类重排，会同时看 query 和 passage，更适合做最终相关性排序。
-
-### 面试回答
-
-我的双路召回是 Milvus 稠密检索 + Elasticsearch 全文检索。Milvus 解决语义相似的问题，ES 解决关键词精确匹配的问题。两路召回后，我没有直接混合分数，因为两个系统的 score 不是一个量纲；我先按文本去重合并，再用 FlashRank 做重排，最终取 Top 10 作为 RAG 上下文。这样既保证召回覆盖，也保证最终进入 LLM 的上下文相关性更高。
-
-### 后续优化
-
-- Elasticsearch 中文分词优化，当前 standard analyzer 对中文不是最优。
-- 引入 RRF 或加权融合，在 rerank 前做更合理的候选排序。
-- 对不同来源设置召回配额，避免某一路结果完全压制另一边。
-- 增加离线评测集，用 recall@k、precision@k、MRR、NDCG 评估召回和重排效果。
+> 英文场景说明：ES 用 `english` analyzer 即可（带英文词干、停用词），**不需要中文 IK 分词器**。
 
 ## 知识库
-
-### 当前项目怎么做
-
-当前项目的知识库以 `tenant_id + collection_name` 做隔离：
-
-- Milvus collection 名称是 `collection_name_tenant_id`。
-- Elasticsearch index 名称也是 `collection_name_tenant_id`。
-- metadata 中也会冗余 `tenant_id` 和 `collection_name`，方便排查和二次校验。
-
-这样可以避免不同租户、不同知识库之间的数据混淆。
+### 文档两级权限（项目已实现）
+- **系统级（scope=system）**：写入共享集合（`tenant_id=__system__`），所有租户都能检索，适合通用 SEO 方法论、行业通用资料。
+- **租户级（scope=tenant）**：写入各租户自己的集合，仅该租户可检索。
+- **检索时的权限控制**：`RetrievalEngine` 只会查询「当前租户集合 + 系统级集合」，物理上不可能读到其他租户的数据；命中结果会标注 `access_scope`，便于溯源。
+- 上传接口通过 `scope` 参数（system/tenant）区分。
 
 ### 知识库更新
+SEO 方法论更新、企业产品文档升级时重新解析、切块、embedding 再入库，保证时效性；建议保留来源、版本、更新时间。
 
-知识库需要在以下场景更新：
+### Agent 结束后反哺知识库
+文章优化/人工审核后，把「问题、原因、解决方案、采纳的证据」结构化入库，形成闭环，为之后相似主题提供经验。
 
-- SEO 方法论更新。
-- 企业产品文档升级。
-- 价格、功能、政策发生变化。
-- 用户发现生成内容依据过旧。
-- 新增 FAQ、案例、竞品资料。
+## RAG 高频面试题（核心护城河）
 
-面试回答：
+### Q1：向量检索和全文检索分别擅长什么场景？为什么必须双路召回？
+**回答思路：**
+- **向量检索（Milvus）**：擅长**语义泛化**和**同义词**。比如用户搜“苹果手机”，能召回包含“iPhone”的文档。缺点是对专有名词、缩写、特定型号（如“BGE-M3”）不敏感，容易召回看似相关但核心实体错误的内容。
+- **全文检索（ES）**：基于 BM25 算法，擅长**精准匹配**。用户搜特定的错误代码、专有名词、人名时，只要字面命中分数就高。缺点是缺乏语义理解，用户换个说法就搜不到。
+- **结论**：单路都有盲区，双路互补能大幅提升召回上限（Recall）。
 
-RAG 的质量很大程度取决于知识库质量。我会把知识库更新作为一个知识工程流程来做：文档更新后重新解析、切块、embedding，并写入 Milvus 和 ES。对于企业内部文档，要保留版本、来源、更新时间，避免模型基于过期资料生成。
+### Q2：你的双路召回是怎么做分数融合的？为什么不用简单的加权求和（如 0.7*向量 + 0.3*全文）？
+**回答思路：**
+- **痛点**：因为量纲不同。向量检索通常是余弦相似度（分数在 0~1 之间），而 ES 的 BM25 分数没有上限（可能几十甚至上百）。直接加权求和需要极其复杂的归一化调参，且换一批数据权重就失效了。
+- **我的方案**：采用 **RRF（倒数排名融合，Reciprocal Rank Fusion）**。它完全抛弃了绝对分数，只看“排名”。公式是 `1 / (K + Rank)`（项目中 K=60）。
+- **优势**：工程实现极简、鲁棒性极强、无需调参，是目前业界做多路召回融合的最优解。融合后再用 FlashRank（Cross-encoder）做一次精准重排，效果最好。
 
-### Agent 结束以后反哺知识库
+### Q3：你的 Chunk Size 是 512 token，如果答案需要跨越多个 Chunk 甚至多篇文档才能总结出来，怎么解决？
+**回答思路：**
+- **定性**：这是典型的多跳问答（Multi-hop QA）难题。
+- **当前项目解法**：通过 `Query 改写`（生成 3-5 个不同角度的 query）来尽量把散落在不同地方的相关碎片都召回回来，然后把所有碎片喂给大模型，由大模型在生成阶段（`generate_article` 节点）做全局总结。
+- **进阶解法（可作为后续优化讲）**：
+  1. **父子块检索（Auto-merging Retriever）**：切块时切成小块（如 128 token）用于精准检索，但实际喂给大模型的是包含这个小块的“父块”（如 1024 token），提供完整上下文。
+  2. **Graph RAG（知识图谱）**：在文档入库时，用 LLM 抽取出实体和关系构建图谱。检索时沿着图谱的边进行多跳游走。
 
-文章优化或人工审核后，可以把高质量结果反哺知识库：
+### Q4：为什么要做 Query 改写？如果大模型改写出来的 Query 完全偏离了用户原意怎么办？
+**回答思路：**
+- **为什么做**：用户输入通常很短且口语化（如“怎么让 AI 不胡说”），和知识库的书面语（如“缓解大模型幻觉的策略”）不匹配。改写能扩充同义词和多角度，提升召回率。
+- **防偏离对策**：
+  1. **Prompt 强约束**：在改写 Prompt 中明确要求“必须保留核心 keywords，不可发散”。
+  2. **保留原 Query**：把用户的原始 Query 也作为其中一路去检索，作为兜底。
+  3. **去重与过滤**：对生成的 Query 做小写去重，限制最多 5 个，防止过度发散带来大量噪声。
 
-- 用户问题。
-- 召回到的证据。
-- 最终采纳的文章段落。
-- 人工修改意见。
-- 质量评估结果。
+### Q5：PDF 解析时，如果表格跨页了怎么处理？
+**回答思路：**
+- **当前项目解法**：目前一期使用 `pdfplumber` 按页抽取（`page.extract_tables()`），跨页的表格会被截断成两个独立的 Markdown 表格。
+- **二期优化思路**：在内存中对比“上一页底部表格”和“下一页顶部表格”的表头（或者判断下一页顶部表格是否没有表头且列数一致）。如果一致，就在二维数组层面把它们拼接起来，最后再统一转成 Markdown 字符串。
 
-这些可以结构化入库，作为后续相似问题的知识来源。
-
-面试回答：
-
-我会把用户反馈和人工审核结果沉淀回知识库，形成闭环。比如某篇文章被人工修改过，我会记录修改前问题、修改后方案、采纳原因和对应证据。之后遇到类似主题时，RAG 不只召回原始文档，也能召回历史优化经验。
+### Q6：怎么评估你的 RAG 系统到底好不好？
+**回答思路：**
+- 我把评估分为两层，并在项目中通过 `eval/run_eval.py` 脚本落地：
+- **第一层：检索质量（不依赖 LLM，便宜快速）**：构建离线测试集（Query - 标注关键词），计算 **Recall@K**（召回率，是否召回了相关内容）和 **Precision@K**（准确率，Top-K 里有多少是相关的）。同时对比 RRF 融合前后、重排前后的指标变化。
+- **第二层：生成质量（依赖 Ragas 框架）**：使用 LLM-as-a-Judge 评估四个核心指标：
+  - `Faithfulness`（忠实度：回答是否都在参考资料里，防幻觉）
+  - `Answer Relevancy`（相关性：回答是否切题）
+  - `Context Precision`（上下文精确度：有用的参考资料是否排在前面）
+  - `Context Recall`（上下文召回率：参考资料是否足以回答问题）
 
 
 
@@ -284,6 +182,70 @@ RAG 的质量很大程度取决于知识库质量。我会把知识库更新作�
 
 <font style="color:rgb(0, 0, 0);background-color:rgba(0, 0, 0, 0);">LangGraph 通过</font>**<font style="color:rgb(0, 0, 0);background-color:rgba(0, 0, 0, 0);">异常捕获 + 状态驱动 + 条件路由</font>**<font style="color:rgb(0, 0, 0);background-color:rgba(0, 0, 0, 0);">实现失败、重试、降级，通过</font>**<font style="color:rgb(0, 0, 0);background-color:rgba(0, 0, 0, 0);">检查点持久化</font>**<font style="color:rgb(0, 0, 0);background-color:rgba(0, 0, 0, 0);">实现断点续传，全程工作流可观测、可恢复、可降级。</font>
 
+### 项目落地（对照 `DAG/workflow.py`，面试可直接讲）
+项目里的生成链路本身就是一个 DAG：`rewrite_query → retrieve_rag → search_serp → generate_titles →(中断:选标题)→ generate_outlines →(中断:选大纲)→ generate_article → quality_check → END`。
+
+- **持久化 / 断点续传**：编译图时挂 `SqliteSaver`（落盘 `checkpoints.sqlite`），按 `thread_id` 存每步状态；进程重启后能从最新检查点继续。SQLite 不可用时降级为 `MemorySaver`，保证可启动。
+- **人机交互中断**：`interrupt_before=["generate_outlines","generate_article"]`，生成标题/大纲后暂停，等前端写回用户选择（`update_state`）再 `invoke(None)` 续跑——这就是三段式生成的实现方式。
+- **重试 / 降级（节点级）**：
+  - 检索：单个 query 召回失败就跳过该 query（不阻断整体）；rerank 失败则降级为“按 RRF 融合分直接取 Top-K，不重排”。
+  - 外部搜索：SerpAPI 失败 → `serp_results=[]`，降级为仅用知识库。
+  - 质量评估：LLM 返回非法 JSON / 异常 → 返回带原因的兜底报告，而不是整条流程报错。
+- **LLM 降级**：所有节点的模型调用走 `LLMService`，自带多 provider 降级 + 重试（见“技术选型 / 大模型”）。
+- **可观测**：每次运行挂 Langfuse callback（云端，可选），自动上报 prompt/模型/token/耗时/调用链。
+
+### DAG / LangGraph 高频面试题（贴 `DAG/workflow.py`）
+
+#### Q1：这条流程用普通函数顺序调用也能跑，为什么非要上 LangGraph？
+**标准答案**：因为我需要三个普通脚本给不了的能力，而 LangGraph 原生支持：
+1. **状态持久化（Checkpoint）**：每个节点执行完自动落盘，进程崩了能从断点续跑，不用从头重跑（重跑 = 重新烧钱调 LLM）。
+2. **人机交互中断（Interrupt）**：我的业务是「标题→大纲→正文」三段式，中间要等用户选，普通函数做不到“执行到一半挂起、等外部输入再继续”。
+3. **统一的状态流转 + 可观测**：所有节点共享一个 `State`，配合 Langfuse 能把整条链路串成一条 trace。
+> **一句话**：流程简单确实不用 LangGraph，但只要涉及「持久化 + 人工介入 + 可观测」，它能省掉一大堆自己造的轮子。
+
+#### Q2：你的 State 怎么设计的？节点之间是怎么传数据的？
+**标准答案**：用 `TypedDict` 定义 `SEOState`，关键是加了 `total=False`——表示**所有字段都可选**，每个节点只需返回它负责更新的那部分字段，LangGraph 自动 merge 进全局 State，不用每个节点都把整个 State 传一遍。
+- 比如 `_rewrite_query` 只 `return {"rewritten_queries": [...]}`，`_retrieve_rag` 只 `return {"rag_docs": [...]}`。
+- 好处：节点解耦、职责单一，新增节点不影响别人。
+**加分点**：默认是“覆盖式”合并；如果某字段需要“追加式”合并（多节点往同一个 list 里加），可以给字段配 **Reducer**（如 `Annotated[list, add]`）。
+
+#### Q3：断点续跑（持久化）具体怎么实现的？
+**标准答案**：编译图时传 `checkpointer`，我用 `SqliteSaver` 把 checkpoint 落到 `checkpoints.sqlite`。运行时靠 `config={"configurable": {"thread_id": xxx}}` 区分会话——同一个 `thread_id` 就是同一条流程的状态线。
+- 每执行完一个节点，状态 + 进度就持久化一次；服务重启后用同一个 `thread_id` 调用，就能从最近的 checkpoint 继续，而不是从头跑。
+- **降级**：`SqliteSaver` 不可用时我 catch 住、退回 `MemorySaver`（内存级），保证服务至少能启动。
+**加分点**：thread_id 我直接复用业务的会话 ID，这样持久化粒度和业务天然对齐。
+
+#### Q4：三段式生成的“暂停等用户选”是怎么做的？（Human-in-the-loop）
+**标准答案**：编译图时设 `interrupt_before=["generate_outlines", "generate_article"]`，图执行到这两个节点**之前会自动挂起**。
+- `start()`：跑到生成标题后停住，返回 5 个标题给前端。
+- 用户选完，`choose_title()` 用 `graph.update_state()` 把 `selected_title` 写回 State，再 `graph.invoke(None, config)`（传 None 表示“不给新输入，从断点继续”）→ 生成大纲后又停。
+- `choose_outline()` 同理写回大纲、续跑 → 生成正文 + 质检 → END。
+> **为什么不一把生成**：标题/大纲是“岔路口”，让用户在便宜的早期环节把方向定准，避免直接生成一篇千字文却跑偏，**省钱又可控**。
+
+#### Q5：某个节点失败了，整条流程会不会崩？你的降级策略是什么？
+**标准答案**：我做的是**节点级降级**，核心原则是“单点失败不拖垮全局，能兜底就兜底”：
+- **检索**：多个改写 query 逐个召回，**单个 query 失败就 `continue` 跳过**，不影响其他 query。
+- **重排**：rerank 抛异常 → 降级为“不重排，直接按 RRF 融合分取 Top-K”。
+- **联网搜索**：SerpAPI 失败 → `serp_results=[]`，降级为**只用知识库**生成。
+- **质检**：LLM 返回非法 JSON / 异常 → 返回带原因的**兜底质量报告**，而不是让整条流程报错。
+- **LLM 调用**：所有节点走 `LLMService`，自带多 provider 降级（DeepSeek→千问→豆包）+ 重试。
+> **一句话**：每个节点都问自己“我挂了，下游还能不能拿到一个能用的结果？”
+
+#### Q6：节点重复执行 / 重试会不会出问题？幂等怎么考虑？
+**标准答案**：要分两种节点看：
+- **检索类节点**（rewrite/retrieve/serp）天然接近幂等，重跑顶多结果略有波动，无副作用，可以放心重试。
+- **生成类节点**（调 LLM）**不是幂等的**——同样输入也可能给不同输出，且每次都花钱。所以我不在节点内部盲目重试整段，而是：① 把 LLM 的重试收敛到 `LLMService` 里做有限次；② 靠 checkpoint 保证“已经成功的节点不会被重复执行”，续跑时是从失败点之后开始，而不是把前面成功的节点再跑一遍。
+**加分点**：如果未来节点要写库（如反哺知识库），我会用业务唯一键做幂等去重，防止重试导致重复写入。
+
+#### Q7：怎么监控这条 DAG 的运行进度和状态？
+**标准答案**：两个层面：
+- **状态查询**：任意时刻用 `graph.get_state(config).values` 拿到当前 State，知道跑到哪、各字段值是什么（前端就是靠这个拿标题/大纲/结果）。
+- **全链路 trace**：每次运行挂 Langfuse callback，按 `thread_id` 把每个节点的 prompt/模型/token/耗时/失败点串成一条 trace，线上能直接看“哪个节点慢、哪个节点贵、哪个节点走了降级”。
+
+#### Q8（进阶钩子）：现在质检 `quality_check` 只打分，分数低了能自动重写吗？
+**标准答案**：当前一期是**线性 DAG**，质检只产出分数 + 风险 + 建议，不自动回炉（控制成本、避免死循环）。
+**演进方向**：把 `quality_check` 后面从固定边改成**条件边（Conditional Edge）**——分数低于阈值就路由回 `generate_article` 重写，并在 State 里维护重试计数，超过上限就停下来交人工。这其实就是往「Reviewer Agent 闭环」演进的第一步（属于二期多 Agent 规划）。
+
 ## DAG 实现方式-一期
 ### 业界常用的 RAG + Agent 工程化方案（简洁版）
 #### 1) 数据与知识库层（Knowledge Pipeline）
@@ -343,9 +305,49 @@ RAG 的质量很大程度取决于知识库质量。我会把知识库更新作�
 ## 如何更好得写提示词
 ## 如何监控 Agent 工作流的进度和状态
 # 技术选型
+
+> 前提：小公司、**没有私有化部署预算**，全部走 **API 调用**。所以选型核心是“效果够用 + 成本可控 + 可随时切换/降级”，而不是“自己部署一套”。
+
 ## 大模型如何选型
+### 项目做法
+统一封装三家国产大模型，**全部走 OpenAI 兼容接口**，调用方式完全一致（`LLMService`）：
+- DeepSeek（默认主力，性价比高）
+- 通义千问 Qianwen
+- 豆包 Doubao（火山方舟，注意填推理接入点 ID）
+
+切换只需改 `DEFAULT_LLM_PROVIDER`，其余代码不动。
+
+### 失败降级 + 重试（项目已实现）
+- 主 provider 调用失败 → 按 `FALLBACK_PROVIDERS` 顺序自动切换到备用模型。
+- 单个 provider 内对偶发错误（限流/网络）重试 `LLM_MAX_RETRIES` 次。
+- 这样既能按成本路由（便宜模型优先），又保证某家服务抖动时整体不挂。
+
+### 选型逻辑（面试怎么说）
+1. **为什么 API 不私有化**：私有化要 GPU、运维、模型迭代跟不上，小公司不划算；API 按量付费、随时用最新模型。
+2. **为什么统一 OpenAI 兼容接口**：屏蔽厂商差异，方便 A/B、灰度、按成本/质量路由，避免被单一厂商锁定。
+3. **怎么按场景路由**：简单步骤（query 改写、质量打分）用便宜模型；正文生成等关键步骤用更强模型。
+4. **稳定性**：多 provider 降级 + 重试 + （可加）语义缓存。
+
 ## Embedding 如何选型
+### 项目做法
+用 `BAAI/bge-small-en-v1.5`（英文、384 维），本地用 sentence-transformers 跑（embedding 不像 LLM 那样必须走付费 API，本地小模型即可，省成本）。重排用英文 cross-encoder `ms-marco-MiniLM-L-12-v2`（FlashRank）。
+
+### 选型逻辑（面试怎么说）
+1. **语言匹配**：内容是英文，必须用英文 embedding；中文模型在英文上效果差。
+2. **维度权衡**：small/384 检索快、占用小、效果够；不够再升级 base(768)/bge-m3（要重建 Milvus 集合）。
+3. **为什么 embedding 本地、LLM 走 API**：embedding 模型小、可离线、调用量大，本地跑省钱且稳定；生成式 LLM 大、迭代快，走 API 更划算。
+4. **要不要 rerank**：双路召回 + RRF 后用 cross-encoder 重排，能显著提升 Top-K 精度，cross-encoder 比 bi-encoder 更准但更慢，所以只对候选集（几十条）重排。
+
 ## Java 和 Python 如何选型
+### 项目做法（职责划分）
+- **Java（Spring Boot 网关）**：对外 API 网关、租户管理、鉴权、业务编排、转发请求给 Python；集成 SpringDoc Swagger。
+- **Python（FastAPI）**：AI / RAG / LangGraph 工作流、文档解析、embedding、检索、生成；集成 FastAPI 自带 Swagger。
+
+### 选型逻辑（面试怎么说）
+1. **Python 做 AI**：LangChain/LangGraph/sentence-transformers/pymilvus/ragas 等 AI 生态都在 Python，AI 能力首选 Python。
+2. **Java 做网关/业务**：企业已有 Java 体系、Spring 生态成熟，做鉴权、多租户、事务、对接内部系统更稳。
+3. **怎么协作**：Java 网关统一入口和权限，把 AI 相关请求转发给 Python 服务；两边各自出 Swagger 便于联调。
+4. **好处**：AI 迭代和业务系统解耦，各用各自最擅长的生态，互不拖累。
 # AI 编程
 面试官会问我，如何用 AI 编程提升效率，我现在主要用 CUrsor,Trae
 
@@ -447,278 +449,219 @@ Anthropic 官网，github 等地方
 
 
 
-# 重点
-上述是准备 AI 的全量知识，我希望把重点放在下面三个上，到时候方便面试集中精力
+# 重点（面试引导剧本）
 
+> **两层结构**
+> - `# Rag` / `# Agent` / `# 技术选型` = **弹药库**（被深挖时有细节可讲）
+> - 本节 = **剧本**（我主动抛亮点和主线，把面试官引到我准备最透的地方）
+>
+> **当前范围**：一期 **RAG + DAG**，不含多 Agent（二期）。
 
-## 如何解决 AI 幻觉问题，提升文章生成质量
+---
 
-### 结合当前项目的整体链路
-当前项目是一个 SEO 文章生成 RAG 系统，核心链路是：
+## 这个重点到底在回答什么？
 
-1. 用户上传 PDF / MD / TXT / DOCX 文档。
-2. `DocumentProcessor` 解析文档文本。
-3. `TextChunker` 使用 `RecursiveCharacterTextSplitter` 切块，当前配置是 `chunk_size=512`，`chunk_overlap=128`，分隔符包含段落、换行、中文句号、感叹号、问号等。
-4. `EmbeddingService` 使用 `BAAI/bge-small-zh-v1.5` 生成 512 维向量。
-5. `VectorStore` 同时写入 Milvus 和 Elasticsearch：
-   - Milvus 存向量，用于语义召回。
-   - Elasticsearch 存全文，用于关键词召回。
-   - 按 `collection_name + tenant_id` 做物理隔离，避免不同租户知识混淆。
-6. 查询时 `RetrievalEngine` 做双路召回：
-   - Milvus：向量相似度召回，适合语义相近但关键词不完全一致的问题。
-   - Elasticsearch：全文召回，适合精确词、品牌词、术语、型号等关键词。
-7. `RerankService` 使用 FlashRank 多语言重排模型，把两路候选统一重排，最终返回 Top-K。
-8. `SEOWorkflow` 使用 LangGraph 编排：
-   - `retrieve_rag` 检索知识库。
-   - `search_serp` 调用 SerpAPI 获取实时网页信息。
-   - `generate_titles` 生成标题。
-   - 用户选择标题后 `generate_outlines` 生成大纲。
-   - 用户选择大纲后 `generate_article` 生成文章。
+| 维度 | 内容 |
+|------|------|
+| **面试主问题** | 如何解决 AI 幻觉、提升英文 SEO 文章生成质量？ |
+| **技术主线** | RAG 找证据 → grounding 约束生成 → quality_check 质检 → Langfuse/Ragas 可观测与回归 |
+| **项目定位** | 面向英文 SEO 的**多租户 RAG + LangGraph 可控生成**，不是「接向量库就出一篇文章」 |
 
-面试表达：我不是直接把用户问题丢给大模型，而是先用 RAG 和搜索引擎构造可信上下文，再让模型在上下文范围内生成，减少模型凭空编造。
+**一句话记住**：防幻觉是**目标**，四道防线是**手段**，RAG + DAG 是**载体**。
 
-### 提升召回率和精准度
+---
 
-#### 1. 双路召回
-当前项目用了 Milvus + Elasticsearch 的双路召回：
+## 先背这三段（开场用）
 
-- 向量召回解决“语义相似但表达不同”的问题，比如用户问“如何降低 AI 编造内容”，知识库写的是“幻觉治理”。
-- 全文召回解决“关键词必须命中”的问题，比如品牌名、产品型号、专有名词、法规条款。
-- 两路召回的分数体系不同，所以项目里没有直接按原始分数排序，而是先合并去重，再交给 FlashRank 重排。
+### ① 30 秒项目介绍
+> 我做的是一套**面向英文 SEO 的多租户 RAG 生成系统**。核心不是堆模型，而是解决四件事：**证据找得对不对、生成能不能溯源、质量能不能评估、改动会不会改崩**。  
+> 知识库分**系统级共享 + 租户级隔离**；生成用 **LangGraph 三段式**（标题→大纲→正文），中间人工定方向；正文强制 `[KBx]`/`[WEBx]` 引用，前端可核对；生成后有 **quality_check** 打分，全程 **Langfuse** 可追踪。
 
-面试表达：向量召回偏 recall，关键词召回偏 precision，重排负责最终相关性排序。
+### ② 3 个差异化亮点（面试官最容易记住）
+1. **可证明的忠实度**：grounding 规则 + 结构化 citations + `citation_coverage` 打分，证据来自系统库还是租户库可标注——**能演示、能核对**。
+2. **多租户知识隔离**：检索只查「本租户 + 系统级」，`tenant_002` 搜不到 `tenant_001` 私有文档——**B2B / 出海营销真实场景**。
+3. **可控生成链路（RAG + DAG）**：LangGraph 编排全链路，**interrupt 人机选标题/大纲**、**checkpoint 断点续跑**、**节点级降级**——不是一次性调 API 出全文。
 
-#### 2. 切块策略
-当前项目使用 512 字符左右的 chunk，128 overlap。这样做的原因：
+### ③ 一句话主线（抛钩子）
+> “我把它拆成 **RAG 检索增强 + 四道防线**：**① 召回与精排**（证据找全排准）→ **② grounding**（只能照证据说并标注引用）→ **③ quality_check**（生成后评估忠实度/引用覆盖）→ **④ Langfuse + 离线评测**（可观测、可回归，改 prompt 不翻车）。”
 
-- chunk 太大：召回粒度粗，容易把无关内容一起塞给模型，降低答案忠实度。
-- chunk 太小：上下文不完整，模型拿不到完整因果关系，容易断章取义。
-- overlap 可以缓解句子、段落被切断的问题，让跨段信息在相邻 chunk 中保留。
+**留钩子（停顿等面试官接话）**：
+> “检索、grounding、质检和 Langfuse 我都接到主流程里了。您想从**检索、防幻觉、LangGraph 工作流**，还是**评测监控**哪块往下聊？”
 
-后续可以优化：
+---
 
-- 按标题、段落、Markdown 层级做结构化切块，而不是只按字符切。
-- 在 metadata 里记录 `doc_id`、`section_title`、`page_number`、`chunk_id`，方便答案溯源。
-- 对 SEO 文档可以按“标题、问题、解决方案、结论”做语义切块，提高文章生成时的上下文完整性。
+## 引导提问表（他问我往哪引）
 
-#### 3. Embedding 选型
-当前项目使用 `BAAI/bge-small-zh-v1.5`，适合中文语义检索，维度 512，速度和成本较低。
+| 面试官可能问 | 引到哪里 | 一句话钩子 |
+|-------------|----------|-----------|
+| 怎么提升召回率/精准度？ | `# Rag`、**RAG 高频题 Q1/Q2** | 双路互补 + RRF，不是简单加权 |
+| 切块 / embedding 怎么选型？ | `# Rag / 切块`、`# 技术选型` | 512/128 token、bge-small-en 384 维 |
+| 多租户 / 权限怎么做？ | `多租户与文档权限说明.md` | 系统级 + 租户级，只查两个 scope |
+| 怎么防幻觉 / 怎么证明没编？ | 防线②③ + 前端 citations 演示 | 强制引用 + 引用覆盖打分 |
+| 知识库没更新怎么办？ | SerpAPI 节点 + KB/WEB 融合 | 私有知识 + 实时联网互补 |
+| 为什么用 LangGraph？ | **DAG 高频题 Q1/Q4** | interrupt 人机协同 + checkpoint |
+| 节点挂了怎么办？ | **DAG 高频题 Q5**、追问 Q6 | 单 query 跳过、rerank/SERP/LLM 降级 |
+| 怎么评估 RAG？ | **RAG 高频题 Q6**、防线④ | recall@k + Ragas 四指标 |
+| 怎么监控 / 怎么回归？ | 追问 Q4/Q5、Langfuse | push 上云 + 固定评测集对比基线 |
 
-选型时重点看：
+---
 
-- 是否适合中文。
-- 向量维度和存储成本。
-- 召回效果，最好用自己的业务数据评测，而不是只看榜单。
-- 是否需要多语言，如果中英文混合，就考虑 bge-m3、multilingual-e5 等模型。
+## 落地边界（被追问时用，显得诚实）
 
-面试表达：Embedding 不是越大越好，业务中要在召回效果、推理速度、存储成本之间平衡。
+| 能力 | 状态 |
+|------|------|
+| 双路召回、RRF、rerank、query 改写、两级权限 | ✅ 已接主流程 |
+| grounding 规则、citations 返回前端 | ✅ 已接主流程 |
+| `quality_check` 质量报告 | ✅ 已接主流程（一期：报告 + 人工决策，**不自动回炉**） |
+| Langfuse 全链路 trace | ✅ 已接（配置在 `DAG/config.py`） |
+| `eval/run_eval.py` + Ragas | ✅ 离线回归脚本（改参数前先跑） |
+| 质检不达标自动重写 | 🔜 二期（条件边 + 重试上限） |
 
-#### 4. Query 改写
-当前项目的生成链路里，RAG 查询是 `topic + keywords`。这是简单有效的第一版，但还有提升空间：
+---
 
-- 同义词扩展：把“幻觉”扩展为“编造、事实错误、不忠实、hallucination”。
-- 多查询改写：把一个问题拆成多个检索 query，例如“召回率怎么提升”“RAG 如何防幻觉”“文章忠实度怎么评估”。
-- HyDE：先让模型生成一个理想答案草稿，再用草稿做向量检索，提升语义召回。
-- 意图拆解：把用户想生成 SEO 文章的需求拆成“主题背景、用户痛点、解决方案、竞品信息、FAQ”等多个检索方向。
+## 四道防线（展开话术）
 
-面试表达：Query 改写的目标不是让问题变长，而是让检索 query 更接近知识库中的表达方式，提高召回率和覆盖面。
+### 防线① 检索质量——证据找得全、排得准
+**为什么先做检索**：幻觉的第一来源往往是证据不到位——没召回就瞎编，排序差就被噪声带偏。
 
-### 解决 AI 幻觉
+**项目做法**：
+- **召回**：tiktoken 切块 + 25% overlap → query 改写 3-5 条（去重）→ Milvus 向量 + ES 全文双路召回。
+- **精排**：RRF 融合（量纲不同不能简单加权）→ FlashRank 重排 → Top-10。
+- **干净**：只检索「当前租户 + 系统级」，避免越权和无关噪声。
 
-#### 1. 没有检索结果怎么办
-如果 RAG 没有召回有效内容，不能让模型自由发挥。应该做降级：
+**追问往哪引**：RRF → **RAG Q2**；512/128 → **`# Rag / 切块`**；召回不全 → **RAG Q3**（父子块 / GraphRAG 作二期思路）。
 
-- 明确告诉模型“知识库未检索到相关内容，不要编造事实”。
-- 允许模型只输出通用建议，但要标注“非知识库依据”。
-- 触发 SerpAPI 网络搜索，用实时网页补充。
-- 对关键业务场景返回“缺少资料，请补充文档”，而不是生成看似完整但不可靠的内容。
+---
 
-当前项目里 `_format_rag()` 在没有 RAG 内容时会返回“（无）”，这可以继续加强：在 prompt 中明确要求模型遇到“（无）”时不要伪造知识库事实。
+### 防线② grounding——模型只能照着证据说
+**项目做法**：
+- Prompt 写死：优先 `knowledgeBase`，再用 `web_info`；事实句末标 `[KBx]`/`[WEBx]`。
+- **没检索到**：不许编内部事实，显式说明资料不足。
+- **证据与先验冲突**：以检索证据为准，冲突记入质量报告风险项。
+- 返回结构化 **citations**，前端展示来源与 scope（系统级/租户级）。
 
-#### 2. 检索内容和模型知识冲突怎么办
-如果检索内容与模型预训练知识冲突，优先级应该是：
+**追问往哪引**：假引用 → 防线③ `citation_coverage` + Ragas Faithfulness；时效性 → **SerpAPI** 补 WEB 证据。
 
-1. 用户上传的知识库。
-2. 实时搜索结果。
-3. 模型自身知识。
+---
 
-原因是知识库通常代表企业内部事实、产品规则或最新资料。面试时可以说：我的策略是“上下文优先”，模型只负责语言组织和推理，不让它覆盖业务事实。
+### 防线③ 质量闸——生成完再评估
+**项目做法**：
+- DAG 末节点 `quality_check`：LLM-as-a-Judge 打 **faithfulness / relevance / structure / citation_coverage**，输出风险与建议。
+- 英文文章模版作 system 指令，约束 SEO 结构。
+- **一期**：出报告，人工决定是否重试；**不声称**已自动打回重写。
 
-可落地做法：
+**追问往哪引**：Judge 不准 → **Ragas 离线评测**作客观回归；生成跑偏 → **interrupt 选标题/大纲** + grounding。
 
-- Prompt 里写清楚“必须优先依据 knowledgeBase，不得使用与 knowledgeBase 冲突的信息”。
-- 生成后做事实一致性校验，让模型逐条检查文章中的关键事实是否能在 RAG 或网页结果中找到依据。
-- 对没有依据的句子打标或删除。
-- 输出引用来源，比如 chunk_id、文件名、网页链接，方便人工复核。
+---
 
-#### 3. 限制模型自由发挥
-当前项目已经做了几件事：
+### 防线④ 可观测 + 可回归——看得见、改不坏
+**项目做法**：
+- **Langfuse**：按 `thread_id` 串 prompt / 模型 / token / 耗时 / 命中证据 / 降级路径（push 模式，本地可上报云端）。
+- **离线评测**：`eval/dataset.json` 固定 query + 标注；`run_eval.py` 跑 recall@k / precision@k / 重排增益；`--with-ragas` 跑生成质量。**改 prompt / 检索参数 / 模型前先对比基线。**
 
-- 标题和大纲阶段要求模型返回 JSON，降低格式漂移。
-- 文章阶段把 `knowledgeBase` 和 `web_info` 单独传入 prompt。
-- 通过 LangGraph 拆成标题、大纲、文章三个阶段，并在标题和大纲处加入人工选择，减少一次性生成导致的方向偏差。
+**追问往哪引**：监控指标 → **追问 Q4**；防改崩 → **追问 Q5**；线上故障 → **追问 Q6** + DAG 节点降级。
 
-还可以增强：
+---
 
-- 在系统 prompt 中加入“只能基于参考资料回答；没有依据要说明无法确认”。
-- 要求模型输出“事实来源映射”，例如每段对应哪些 chunk。
-- 对文章做二次校验：相关性、忠实度、是否包含无依据事实。
+## 2 分钟现场演示（可选，印象分高）
 
-### 提升文章生成质量
+1. **租户隔离**：`tenant_001` 上传租户级文档 A；`system` 上传共享文档 B → `tenant_002` 只能搜到 B，搜不到 A。
+2. **可溯源**：走完生成三步 → 看引用表里的 `[KBx]`、scope、质量分里的 **citation_coverage**。
+3. **可追踪**：Langfuse 里打开同一条 `thread_id` trace，指给面试官看检索→生成各节点耗时。
 
-当前项目不是一次性生成文章，而是三阶段生成：
+---
 
-1. 先生成 5 个标题，让用户选择方向。
-2. 再生成 3 套大纲，让用户选择结构。
-3. 最后按选定大纲生成完整文章。
+## 收尾话术
+> “总结就是：**先靠 RAG 把证据找全排准，再用 grounding 和引用把生成锁住，生成后用 quality_check 评估，最后用 Langfuse 和离线评测保证持续迭代不翻车**。您想从哪块继续深聊？”
 
-这样做的好处：
+---
 
-- 降低长文本一次生成的不确定性。
-- 用户可以在关键决策点介入，避免文章跑偏。
-- 标题、大纲、正文分别优化，更符合 SEO 内容生产流程。
+## 如何解决 AI 幻觉问题，提升文章生成质量（详细展开）
 
-文章质量可以从四个维度提升：
+> 上面是**精简背诵版**；下面是同一主线的**展开版**。内容一致，面试前以「先背三段 + 引导表」为主，被追问再翻本节细节。
 
-- 忠实度：内容是否能被知识库或网页搜索结果支持。
-- 相关性：是否紧扣 topic、keywords 和用户意图。
-- 结构性：标题、大纲、段落是否符合 SEO 文章结构。
-- 可读性：语言是否自然、信息是否完整、是否有重复和空话。
+### 第 0 步：与「一句话主线」相同（见上 §③）
+四道防线钩子：**召回精排 / grounding / 质量闸 / 可观测回归**——面试官任挑其一，下面均有对应展开。
 
-可扩展实现：
+---
 
-- 生成后增加 evaluator 节点，对文章进行评分。
-- 使用 LLM-as-a-Judge 检查“是否忠实于 RAG 上下文”。
-- 对低分文章自动触发重写，重写时只修改问题段落。
-- 加入引用和来源，让文章可追溯。
+### 防线①：检索质量——证据找得全、排得准（钩子：召回率 / 精准度）
+**主线话术**：幻觉的第一来源是“证据不到位”。证据没召回，模型只能瞎编；证据排序差，噪声进了上下文也会带偏。所以我先把检索做扎实：
+- **召回（recall）**：tiktoken 语义切块 + 25% overlap 防边界截断 → query 改写成 3-5 个多角度 query（去重）→ Milvus 向量 + ES 全文**双路召回**互补。
+- **精排（precision）**：多路结果用 **RRF 融合**（对分数量纲不敏感）→ FlashRank cross-encoder 重排 → 取 Top-10 高相关证据。
+- **干净**：两级权限只检索“当前租户 + 系统级”，杜绝越权/无关数据污染上下文。
 
-### Langfuse 如何做全链路监控
+**埋的钩子 → 被追问时往哪引**：
+- 问“双路为什么不直接加权求和？” → 引到 **RAG 高频题 Q2（RRF）**，讲量纲问题 + `1/(K+rank)` + K=60 经验值。
+- 问“切块 512/128 怎么定的？” → 引到 **`# Rag / 切块`**，讲语义完整 vs 检索精度的折中。
+- 问“召回还是不全怎么办？” → 引到 **RAG 高频题 Q3（多跳）**，抛父子块检索 / GraphRAG，显示纵深。
 
-当前项目还没有真正接入 Langfuse，但可以作为下一步可观测性建设。Langfuse 适合记录 LLM 调用、RAG 检索、Agent/DAG 节点耗时、token、成本、评分等。
+---
 
-#### 1. Trace 设计
-一次文章生成用一个 trace，对应一个 `thread_id`：
+### 防线②：强制证据引用 grounding（钩子：模型凭什么不编）
+**主线话术**：证据齐了，还要逼模型“只能照着证据说”。我在生成 prompt 里写死了 grounding 规则：
+- 优先用 `knowledgeBase`，再用 `web_info`；事实/数据/定义/方案**必须在句末标注来源** `[KB1]`/`[WEB2]`。
+- **没检索到**（knowledgeBase 为 none）：明确不许编内部事实，只能用 web 或一般性表述，并显式说明“资料不足”——宁可不说，也不编。
+- **证据和模型先验冲突**：以检索证据为准（RAG 的前提就是外部知识优先），冲突点丢给质量闸当风险项暴露。
+- 工作流把 `citations`（KB/WEB 来源）结构化返回前端，可点开核对。
 
-- trace name：`seo_article_generation`
-- user_id：`tenant_id`
-- session_id：`thread_id`
-- metadata：`topic`、`keywords`、`collection_name`、`llm_provider`
+**埋的钩子 → 被追问时往哪引**：
+- 问“怎么保证它真的引用了，而不是假装引用？” → 引到防线③的 `citation_coverage` 打分 + Q6 的 Faithfulness 指标。
+- 问“实时性问题怎么解决（知识库没更新）？” → 引到 **SerpAPI 联网节点**，讲 KB + WEB 融合 + 溯源标签。
 
-#### 2. Span 设计
-每个关键步骤记录一个 span：
+---
 
-- `document_parse`：文档解析耗时、文件类型、文本长度。
-- `chunking`：chunk 数量、chunk_size、chunk_overlap。
-- `embedding`：embedding 模型、向量维度、耗时。
-- `milvus_search`：召回数量、top score、耗时。
-- `es_search`：召回数量、top score、耗时。
-- `rerank`：候选数量、Top-K、rerank_score、耗时。
-- `serp_search`：搜索结果数量、抓取成功率、耗时。
-- `generate_titles`：输入 token、输出 token、耗时、模型、费用。
-- `generate_outlines`：输入 token、输出 token、耗时、模型、费用。
-- `generate_article`：输入 token、输出 token、耗时、模型、费用。
+### 防线③：质量闸——生成完再评估（钩子：LLM-as-a-Judge / Ragas）
+**主线话术**：生成不是终点，我在 DAG 里加了 `quality_check` 节点做**生成后质检**：
+- 用 LLM-as-a-Judge 打 4 个分：**faithfulness（忠实度）、relevance（相关性）、structure（结构）、citation_coverage（引用覆盖）**，并产出风险项 + 改进建议。
+- 英文文章模版作为 system 指令，约束结构与写作规则，从源头保证格式质量。
+- **当前一期**：先产出质量报告 + 风险项，供人工决策是否重试；**不自动回炉**（二期可用条件边 + 重试上限）。
 
-#### 3. 监控指标
-RAG 指标：
+**埋的钩子 → 被追问时往哪引**：
+- 问“LLM 打分不准 / 自己夸自己怎么办？” → 引到 **Ragas 离线评测**（用独立框架 + 标注集做客观回归），讲 Q6 四指标。
+- 问“怎么防止生成跑偏？” → 引到 **grounding + 人工选标题/大纲（interrupt）+ quality_check**，讲可控生成而非一次性出全文。
 
-- recall 命中率：人工标注答案所需 chunk 是否被召回。
-- precision：Top-K 中真正相关 chunk 的比例。
-- MRR / NDCG：相关 chunk 排名是否靠前。
-- empty retrieval rate：无召回比例。
-- rerank 前后相关性提升。
+---
 
-生成指标：
+### 防线④：可观测 + 可回归——改动不翻车（钩子：Langfuse / 离线评测）
+**主线话术**：上线后还要能“看得见、改得动、不翻车”：
+- **可观测（Langfuse）**：每次生成的 prompt / 模型 / token / 花费 / 各节点耗时 / 命中证据 / 失败点 / 是否降级，按 `thread_id` 串成一条 trace。Langfuse 是 **push 模式**，本地主动推到云端，本地项目也能上报。
+- **可回归（Ragas + 离线评测集）**：`eval/dataset.json` 沉淀固定 query + 标注，`eval/run_eval.py` 跑 recall@k / precision@k / 重排增益（不花钱），`--with-ragas` 再跑 faithfulness 等生成质量指标。**每次改 prompt/参数/模型都先跑评测对比基线。**
 
-- faithfulness：文章事实是否被 RAG / SERP 支持。
-- relevance：是否围绕 topic 和 keywords。
-- groundedness：每段是否能找到依据。
-- format correctness：JSON 或 Markdown 格式是否稳定。
-- human acceptance rate：用户是否接受标题、大纲、文章。
+**埋的钩子 → 被追问时往哪引**：
+- 问“可观测具体监控啥指标？” → 引到 **面试常见追问 Q4（可观测）**。
+- 问“怎么保证改 prompt 不把效果改崩？” → 引到 **Q5（可回归）**，讲版本绑定 + 评测集回归。
+- 问“线上某个环节挂了怎么办？” → 引到 **Q6（可降级）** + DAG 的节点级降级（rerank 失败不重排、SERP 失败仅用 KB、LLM 多 provider 降级）。
 
-成本和性能指标：
+---
 
-- 每次生成的输入 / 输出 token。
-- 每个模型的调用次数和费用。
-- RAG 检索耗时、SerpAPI 耗时、LLM 生成耗时。
-- 端到端耗时。
-- 不同模型（DeepSeek / 通义千问 / 豆包）的质量、成本、延迟对比。
+### 收尾（与上文「收尾话术」相同，任选其一背）
+> “整体就是：**检索找全证据 → grounding 约束生成 → 质量闸评估 → 可观测 + 回归保证不翻车**。您想从哪块往下深聊？”
 
-#### 4. 面试表达
-可以这样回答：
+**作用**：选项全在我准备的圈里——检索、防幻觉、LangGraph、评测监控，任选一个都能讲透。
 
-我会把一次文章生成看作一个 trace，把 RAG 检索、Serp 搜索、标题生成、大纲生成、正文生成都作为 span。这样不仅能看到最终文章质量，还能定位问题来自哪里：是召回阶段没召回，还是重排把相关内容排低了，还是 prompt 没约束好，还是模型本身生成质量差。对于 RAG 系统，不能只看最终回答，要把检索质量、上下文质量、生成质量和成本延迟全部串起来看。
+## 多Agent 设计（二期规划）
+> 面试官如果问“为什么一期用 DAG，二期要用多 Agent？”，回答：DAG 适合**步骤固定、流程确定**的任务（如三段式生成）；多 Agent 适合**开放性、需要反复推敲**的任务（如“帮我把这篇文章优化到能排 Google 首页”），需要 Agent 自己规划、调用工具、反思修改。
 
-### 当前项目已经落地的优化点
-
-#### 1. Query Rewrite + 多查询召回
-原来项目只用 `topic + keywords` 做一次检索，现在在 LangGraph 中增加了 `rewrite_query` 节点：
-
-- 先让 LLM 根据主题和关键词生成 3-5 个检索 query。
-- 每个 query 分别走 Milvus + Elasticsearch 双路召回。
-- 合并所有候选 chunk，并按文本去重。
-- 最后仍然用原始 query 作为主意图，通过 FlashRank 做统一重排。
-
-面试表达：
-
-以前是单 query 检索，容易因为用户表达和知识库表达不一致导致漏召回。现在我在 RAG 前面加了一层 query rewrite，把主题拆成多个检索角度，再做多查询召回，可以提升召回覆盖率；同时最后统一 rerank，避免召回变多以后引入太多噪声。
-
-#### 2. Citation 溯源
-生成文章时，项目现在会把 RAG 和网页搜索结果格式化为带编号的上下文：
-
-- 知识库来源：`[KB1]`、`[KB2]`，包含文件名、chunk_id、matched_query。
-- 网页来源：`[WEB1]`、`[WEB2]`，包含标题和链接。
-- Prompt 中要求模型对关键事实尽量标注 `[KBx]` 或 `[WEBx]`。
-- `/api/generate/article` 接口会额外返回 `citations`，前端会展示引用来源和内容预览。
-
-面试表达：
-
-我不只生成文章，还把生成依据一起返回。这样文章里的事实可以追溯到知识库 chunk 或网页链接，方便人工复核，也能减少模型把无依据内容写成事实。
-
-#### 3. 生成后质量评估
-文章生成后，LangGraph 会继续执行 `quality_check` 节点，对文章做 LLM-as-a-Judge 评估：
-
-- `faithfulness`：是否忠实于 RAG / SERP 参考资料。
-- `relevance`：是否围绕 topic 和 keywords。
-- `structure`：是否符合 SEO 文章结构。
-- `citation_coverage`：关键事实是否有来源标注。
-- `overall`：综合分。
-- `risks` / `suggestions`：风险和改进建议。
-
-接口会返回 `quality_report`，前端会展示质量分、风险和建议。
-
-面试表达：
-
-我没有把生成结果当成最终答案直接交付，而是在生成后加了质量评估节点。这样可以量化文章质量，也能定位问题是忠实度不够、相关性不够、结构不好，还是引用覆盖不足。
-
-#### 4. 前端可观测展示
-生成文章后，前端会展示：
-
-- Query 改写结果。
-- 质量评估分数。
-- 风险和建议。
-- 引用来源列表。
-
-面试表达：
-
-这部分是为了让 RAG 链路可解释。面试或演示时，我可以直接展示：用户输入主题后，系统改写了哪些 query、召回了哪些知识、文章用了哪些来源、最终质量评分是多少。
-
-### 下一步可以继续优化
-
-- 接入 Langfuse，把 query rewrite、Milvus 检索、ES 检索、rerank、SerpAPI、LLM 生成、质量评估都记录为 trace / span。
-- 增加自动重写机制：如果 `quality_report.overall` 或 `faithfulness` 低于阈值，自动带着评估建议重写文章。
-- 优化 Elasticsearch 中文分词，当前使用 standard analyzer，对中文关键词检索不是最优，可以考虑 IK 分词或内置中文分析方案。
-- 优化切块策略，按标题和段落结构切块，提高上下文完整性。
-- 增加离线评测集，定期评估召回率、精确率、重排效果和生成质量。
-
-## 多Agent 设计
-+ 如何定义 每个 Agent 的边界和能力
-+ 如何限制Agent 不乱改
-+ 如何做到可观测、可回归、可降级
-+ 如何监控每个 Agent 的运行状态和执行质量
-+ Agent 组最终融合的时候，如何保证质量的？（可能一个 Agent 有问题会导致全盘失败）
-+ LangChain + LangGraph
-+ Harness底层思想,如何控制 AI 工作
-+ 一期使用 DAG，之后升级为多 Agent 共同协作
++ **如何定义每个 Agent 的边界和能力**
+  - **Planner Agent**：负责分析用户意图，拆解任务（如：先查竞品，再查关键词，再改写）。
+  - **Researcher Agent**：专门负责调用 RAG 和 SerpAPI 查资料，总结成报告。
+  - **Writer Agent**：专职写作，只负责把报告转化为符合 SEO 格式的文章。
+  - **Reviewer Agent**：充当“裁判”，用 Ragas 指标或自定义 Rubric 打分，如果不达标就打回给 Writer 重写。
++ **如何限制 Agent 不乱改**
+  - 给 Writer Agent 设定严格的 System Prompt（如：必须保留原意、必须引用 `[KB]`）。
+  - Reviewer Agent 作为**硬性门控（Gatekeeper）**，如果检测到幻觉或未引用证据，直接拦截输出。
+  - 引入 Human-in-the-loop（LangGraph 的 `interrupt`），关键修改必须人点确认。
++ **如何做到可观测、可回归、可降级**
+  - **可观测**：每个 Agent 的思考过程（Thought）和工具调用（Action）都作为独立 Span 上报 Langfuse。
+  - **可回归**：沉淀 100 篇历史文章作为评测集，每次改版 Agent 逻辑，都跑一遍对比 CTR/SEO 评分。
+  - **可降级**：如果 Researcher Agent 查不到资料，降级为“要求用户补充”，而不是让 Writer Agent 瞎编。
++ **如何监控每个 Agent 的运行状态和执行质量**
+  - 在 Langfuse 中给不同 Agent 打上不同的 `tags`（如 `role:researcher`）。
+  - 监控核心指标：Reviewer Agent 的**打回率**（如果太高说明 Writer 有问题或任务太难）、每个 Agent 的 token 消耗占比。
++ **Agent 组最终融合的时候，如何保证质量的？**
+  - 采用 **Supervisor（主管）架构** 或 **StateGraph 状态机**。所有 Agent 不直接对话，而是把结果写回全局 State。
+  - 最终输出前，必须经过一个专门的 `Output_Formatter_Node` 清洗格式，并由 Supervisor 做最后一次兜底校验。
 
 
 

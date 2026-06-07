@@ -18,14 +18,15 @@ public class SearchController {
     
     private final PythonApiService pythonApiService;
     
-    @Operation(summary = "上传文档", description = "上传 PDF/MD/TXT/DOCX 并索引到 Milvus 与 Elasticsearch")
+    @Operation(summary = "上传文档", description = "上传 PDF/MD/TXT/DOCX 并索引到 Milvus 与 Elasticsearch；scope=tenant 租户级，scope=system 系统级共享")
     @PostMapping("/upload")
     public ResponseEntity<JsonNode> uploadDocument(
             @RequestParam("file") MultipartFile file,
             @RequestParam("tenantId") String tenantId,
-            @RequestParam("collectionName") String collectionName
+            @RequestParam("collectionName") String collectionName,
+            @RequestParam(value = "scope", defaultValue = "tenant") String scope
     ) throws Exception {
-        JsonNode result = pythonApiService.uploadDocument(file, tenantId, collectionName);
+        JsonNode result = pythonApiService.uploadDocument(file, tenantId, collectionName, scope);
         return ResponseEntity.ok(result);
     }
     

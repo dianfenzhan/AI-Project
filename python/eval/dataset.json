@@ -1,0 +1,25 @@
+{
+  "description": "离线评测集：固定 query + 标注证据 / 参考答案，用于回归检索与生成质量。每次改 prompt / 检索参数 / 模型，都跑这套对比基线，防止改崩。",
+  "collection_name": "default",
+  "tenant_id": "default",
+  "samples": [
+    {
+      "id": "sample-1",
+      "query": "What are the benefits of organic farming?",
+      "relevant_keywords": ["biodiversity", "soil fertility", "reduces pollution"],
+      "ground_truth": "Organic farming promotes biodiversity, enhances soil fertility, reduces pollution, and produces healthier food without synthetic chemicals."
+    },
+    {
+      "id": "sample-2",
+      "query": "How does email marketing improve customer retention?",
+      "relevant_keywords": ["segmentation", "personalization", "automation", "open rate"],
+      "ground_truth": "Email marketing improves retention through audience segmentation, personalized content, lifecycle automation, and measuring engagement metrics like open and click rates."
+    },
+    {
+      "id": "sample-3",
+      "query": "Best practices for international SEO for cross-border e-commerce",
+      "relevant_keywords": ["hreflang", "localization", "site speed", "backlinks"],
+      "ground_truth": "International SEO best practices include correct hreflang tags, content localization, fast site speed across regions, and building locally relevant backlinks."
+    }
+  ]
+}

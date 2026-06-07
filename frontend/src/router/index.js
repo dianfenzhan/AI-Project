@@ -1,32 +1,28 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import Upload from '../views/Upload.vue'
-import Generate from '../views/Generate.vue'
-import Search from '../views/Search.vue'
+import Home from '../views/Home.vue'
 
 const routes = [
   {
     path: '/',
-    redirect: '/upload'
+    name: 'Home',
+    component: Home
   },
   {
     path: '/upload',
-    name: 'Upload',
-    component: Upload
-  },
-  {
-    path: '/generate',
-    name: 'Generate',
-    component: Generate
+    redirect: { path: '/', query: { tab: 'tenant-upload' } }
   },
   {
     path: '/search',
-    name: 'Search',
-    component: Search
+    redirect: { path: '/', query: { tab: 'search' } }
+  },
+  {
+    path: '/generate',
+    redirect: { path: '/', query: { tab: 'generate' } }
   }
 ]
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory('/seo-frontend/'),
   routes
 })
 

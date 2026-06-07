@@ -1,19 +1,7 @@
 <template>
   <div class="generate-page">
-    <el-card class="generate-card">
-      <template #header>
-        <div class="card-header">
-          <span>SEO 文章生成</span>
-        </div>
-      </template>
-      
+    <el-card class="generate-card" shadow="never">
       <el-form :model="form" label-width="120px">
-        <el-form-item label="租户ID">
-          <el-input v-model="form.tenantId" placeholder="请输入租户ID" />
-        </el-form-item>
-        <el-form-item label="集合名称">
-          <el-input v-model="form.collectionName" placeholder="请输入集合名称" />
-        </el-form-item>
         <el-form-item label="AI 模型">
           <el-select v-model="form.llmProvider" placeholder="请选择AI模型">
             <el-option label="DeepSeek" value="deepseek" />
@@ -136,6 +124,19 @@
           <el-table :data="citations" size="small" style="width: 100%">
             <el-table-column prop="id" label="编号" width="80" />
             <el-table-column prop="type" label="类型" width="140" />
+            <el-table-column label="范围" width="90">
+              <template #default="{ row }">
+                <el-tag
+                  v-if="row.type === 'knowledge_base'"
+                  :type="row.scope === 'system' ? 'warning' : 'info'"
+                  effect="plain"
+                  size="small"
+                >
+                  {{ row.scope === 'system' ? '系统级' : '租户级' }}
+                </el-tag>
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
             <el-table-column label="来源">
               <template #default="{ row }">
                 <span v-if="row.type === 'knowledge_base'">
@@ -159,9 +160,12 @@ import { ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
 
+const props = defineProps({
+  tenantId: { type: String, default: 'tenant_001' },
+  collectionName: { type: String, default: 'acme_kb' }
+})
+
 const form = ref({
-  tenantId: 'default',
-  collectionName: 'default',
   llmProvider: 'deepseek',
   topic: '',
   keywords: ''
@@ -204,8 +208,8 @@ const handleGenerateTitles = async () => {
     const params = {
       topic: form.value.topic,
       keywords: form.value.keywords,
-      tenantId: form.value.tenantId,
-      collectionName: form.value.collectionName,
+      tenantId: props.tenantId,
+      collectionName: props.collectionName,
       llmProvider: form.value.llmProvider
     }
     const response = await axios.post('/api/v1/generate/titles', null, { params })
@@ -301,8 +305,8 @@ const displayScore = (score) => {
 
 <style scoped>
 .generate-page {
-  max-width: 900px;
-  margin: 0 auto;
+  max-width: 100%;
+  margin: 0;
 }
 
 .generate-card {

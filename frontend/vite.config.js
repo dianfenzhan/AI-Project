@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 import path from 'path'
 
 export default defineConfig({
+  base: '/seo-frontend/',
   plugins: [vue()],
   resolve: {
     alias: {
@@ -13,7 +14,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:8080/seo-java',
         changeOrigin: true
       }
     }

@@ -3,11 +3,7 @@
     <el-header>
       <div class="header-content">
         <h1>SEO RAG Platform</h1>
-        <el-menu :default-active="activeMenu" mode="horizontal" router>
-          <el-menu-item index="/upload">文档上传</el-menu-item>
-          <el-menu-item index="/search">知识库搜索</el-menu-item>
-          <el-menu-item index="/generate">文章生成</el-menu-item>
-        </el-menu>
+        <span class="header-subtitle">租户文档 · 系统文档 · 知识库搜索 · 文章生成</span>
       </div>
     </el-header>
     <el-main>
@@ -16,17 +12,10 @@
   </el-container>
 </template>
 
-<script setup>
-import { computed } from 'vue'
-import { useRoute } from 'vue-router'
-
-const route = useRoute()
-const activeMenu = computed(() => route.path)
-</script>
-
 <style scoped>
 .app-container {
   min-height: 100vh;
+  background: #f5f7fa;
 }
 
 .el-header {
@@ -41,8 +30,8 @@ const activeMenu = computed(() => route.path)
   width: 1200px;
   margin: 0 auto;
   display: flex;
-  align-items: center;
-  gap: 40px;
+  align-items: baseline;
+  gap: 16px;
 }
 
 .header-content h1 {
@@ -50,23 +39,14 @@ const activeMenu = computed(() => route.path)
   font-size: 24px;
 }
 
-.el-menu {
-  border: none;
-  background-color: transparent;
-}
-
-.el-menu-item {
-  color: white;
-}
-
-.el-menu-item:hover,
-.el-menu-item.is-active {
-  background-color: rgba(255, 255, 255, 0.2);
+.header-subtitle {
+  font-size: 14px;
+  opacity: 0.9;
 }
 
 .el-main {
   width: 1200px;
   margin: 0 auto;
-  padding: 40px 0;
+  padding: 32px 0 48px;
 }
 </style>
