@@ -98,24 +98,22 @@ npm run dev
 
 ### 访问地址
 
-> 下面括号中是服务名，真实访问地址仍以冒号后的端口为准；不要直接把服务名拼到 URL 后面，否则服务未配置 context path 时会 404。
-
-- 前端 UI（`seo-frontend`）: `http://localhost:5173`
-- Java 后端（`seo-java`）: `http://localhost:8080`
-- Python API（`seo-python`）: `http://localhost:8000`
-- Elasticsearch（`seo-elasticsearch`）: `http://localhost:9200`
-- Kibana（`seo-kibana`）: `http://localhost:5601`
-- Milvus（`seo-milvus`）: `localhost:19530`
-- PostgreSQL（`seo-postgres`）: `localhost:5432`
+- 前端 UI: `http://localhost:5173/seo-frontend`
+- Java 后端: `http://localhost:8080/seo-java`
+- Python API: `http://localhost:8000/seo-python`
+- Elasticsearch: `http://localhost:9200/seo-elasticsearch`
+- Kibana: `http://localhost:5601/seo-kibana`
+- Milvus: `localhost:19530/seo-milvus`
+- PostgreSQL: `localhost:5432/seo-postgres`
 
 ### API 文档（Swagger）
 
 | 服务 | Swagger UI | OpenAPI JSON |
 |------|-----------|--------------|
-| Java 网关 | `http://localhost:8080/swagger-ui/index.html` | `http://localhost:8080/v3/api-docs` |
-| Python RAG/DAG | `http://localhost:8000/docs` | `http://localhost:8000/openapi.json` |
+| Java 网关 | `http://localhost:8080/seo-java/swagger-ui/index.html` | `http://localhost:8080/seo-java/v3/api-docs` |
+| Python RAG/DAG | `http://localhost:8000/seo-python/docs` | `http://localhost:8000/seo-python/openapi.json` |
 
-Python 服务还提供 ReDoc 文档：`http://localhost:8000/redoc`
+Python 服务还提供 ReDoc 文档：`http://localhost:8000/seo-python/redoc`
 
 ### 推荐验证流程
 
