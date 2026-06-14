@@ -1,9 +1,9 @@
 # Rag
 
-> 业务背景：出海营销公司，文章都是**英文**。所以 embedding 用英文模型、ES 用 english 分析器（不用中文 IK 分词）、所有生成 prompt 都要求英文输出。
+> **业务背景（当前）**：知识库文档**要么纯英文、要么纯中文**（单篇不混用）；最终生成文章可以是英文或中文（由 LLM prompt 控制，与索引无关）。Embedding 用通义 **text-embedding-v4**（API）；双路召回：**Milvus 管语义/跨语言，ES 按语言分路管关键词**。
 
 ## 整体链路（对照项目）
-文档上传 → 解析（PDF/MD/TXT/DOCX）→ 切块（tiktoken 控 token）→ 英文 embedding（bge-small-en-v1.5, 384 维）→ 同时写入 Milvus（向量）和 Elasticsearch（全文）→ 检索时 query 改写多路召回 → RRF 融合 → FlashRank 重排 → 交给 LangGraph 生成链路。
+文档上传 → 解析（PDF/MD/TXT/DOCX）→ **语言检测（en/zh）** → 切块（tiktoken 512/128）→ embedding（text-embedding-v4，`text_type=document`）→ 同时写入 **Milvus（向量，不分语言）** 和 **ES（全文，按语言分字段）** → 检索时检测 query 语言 + query 改写多路召回 → RRF 融合 → FlashRank 重排 → LangGraph 生成链路。
 
 ## 文档解析：PDF 三类处理（项目已实现）
 `DocumentProcessor` 对 PDF 分三类处理，所有可选依赖都 try-import，缺失时优雅降级、不影响主流程：
@@ -48,15 +48,240 @@ LangGraph 里有 `rewrite_query` 节点：把 `topic + keywords` 交给 LLM，�
 用户输入短、且表达方式和知识库不一致（用户说 “reduce AI making things up”，库里写 “hallucination / faithfulness”）。改写成多角度 query 能显著提升召回覆盖率（recall）。为了避免召回变多带来的噪声，后面用 RRF + rerank 收敛。
 
 ## 如何双路召回
-### 项目实现
-同一批 chunk 同时写入 Milvus（向量）和 ES（全文）：
-- Milvus：COSINE 向量召回，解决“语义相似但用词不同”。
-- ES：english 分析器全文召回，解决“关键词/术语/品牌精确命中”。
 
-### RRF 融合（项目已实现，替代“智能权重归一化”）
-两路（甚至跨 scope 共 4 路）召回的分数量纲不同（Milvus 余弦 vs ES BM25），**不能直接相加**。项目用 **RRF（Reciprocal Rank Fusion）**：每个 ranked list 里，第 rank 名贡献 `1 / (K + rank)`（K=60），多路分数相加得到融合分。RRF 只依赖“排名”，对量纲不敏感，工程上稳健、实现简单。融合后再交给 FlashRank cross-encoder 重排，最终取 Top-10。
+### 总体架构（面试先讲这张图）
 
-> 英文场景说明：ES 用 `english` analyzer 即可（带英文词干、停用词），**不需要中文 IK 分词器**。
+```mermaid
+flowchart TB
+    subgraph ingest [入库]
+        DOC[文档 chunk] --> LD{语言检测 en/zh}
+        LD -->|en| M1[Milvus 向量 v4]
+        LD -->|zh| M1
+        LD -->|en| ESen["ES text_en · standard"]
+        LD -->|zh| ESzh["ES text_zh · ik_smart"]
+        LD --> META["metadata.lang = en/zh"]
+    end
+
+    subgraph search [检索]
+        Q[用户 query] --> LQ{query 语言检测}
+        Q --> MQ[Milvus 语义召回<br/>全库 · 不分语言]
+        LQ -->|en| SE["ES 关键词 · text_en"]
+        LQ -->|zh| SZ["ES 关键词 · text_zh + IK"]
+        MQ --> RRF[RRF 融合 K=60]
+        SE --> RRF
+        SZ --> RRF
+        RRF --> RR[FlashRank 重排]
+        RR --> TOP[Top-K 上下文]
+    end
+```
+
+**一句话**：Milvus 负责**语义 + 跨语言**；ES 负责**同语言关键词**；RRF 融合后再 rerank。
+
+---
+
+### 业务前提
+
+| 项 | 说明 |
+| --- | --- |
+| 文档语言 | 单篇**纯英文**或**纯中文**，不混排 |
+| 生成语言 | 英文或中文均可，由 **LLM prompt** 决定，与 ES 无关 |
+| 跨语言检索 | 中文 query 搜英文 doc（或反过来）→ **主要靠 Milvus + v4**，不靠 ES |
+| 同语言检索 | 英文搜英文、中文搜中文 → **Milvus + ES 双路互补** |
+
+---
+
+### Milvus 向量路（不分语言）
+
+- 模型：通义 **text-embedding-v4**（1024 维）；入库 `text_type=document`，检索 `text_type=query`。
+- **中英文进同一向量空间**，支持语义相似、同义改写、跨语言对齐。
+- 不按语言拆 collection；租户/系统级隔离仍用现有 `collection + tenant` 逻辑。
+
+---
+
+### ES 全文路（按语言分字段 · 推荐方案）
+
+> **目标方案**（面试/生产推荐）：英文 **standard**，中文 **IK**；入库与检索都按语言路由。  
+> **代码现状**：一期实现为 `text`（standard）+ `text.cjk`（内置 bigram），未装 IK；演进方向见下文。
+
+#### 为什么不能「一个字段动态换分词器」
+
+Elasticsearch 的 analyzer 在 **mapping 建索引时固定**，不能按「每条文档语言」在同字段上自动切换。  
+正确做法：**分字段 + 应用层语言检测 + 查询路由**。
+
+#### 索引 Mapping（目标设计）
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "text": { "type": "text", "index": false },
+      "text_en": { "type": "text", "analyzer": "standard" },
+      "text_zh": { "type": "text", "analyzer": "ik_smart" },
+      "metadata": {
+        "properties": {
+          "lang": { "type": "keyword" }
+        }
+      }
+    }
+  }
+}
+```
+
+| 字段 | 分析器 | 何时写入 |
+| --- | --- | --- |
+| `text_en` | `standard` | 检测到 **纯英文** 文档 |
+| `text_zh` | `ik_smart`（需 IK 插件） | 检测到 **纯中文** 文档 |
+| `metadata.lang` | `keyword` | 入库时写入 `en` 或 `zh`，便于过滤与排查 |
+
+**入库逻辑（概念）**：
+
+```python
+lang = detect_language(text)  # en / zh，可人工覆盖
+doc = {
+    "text": text,
+    "text_en": text if lang == "en" else "",
+    "text_zh": text if lang == "zh" else "",
+    "metadata": {..., "lang": lang},
+}
+```
+
+#### 检索逻辑（概念）
+
+```python
+qlang = detect_language(query)
+field = "text_en" if qlang == "en" else "text_zh"
+
+# 只搜对应语言字段，避免两路 multi_match 带来噪声
+es_query = {
+    "bool": {
+        "must": [{"match": {field: query}}],
+        "filter": [{"term": {"metadata.lang": qlang}}]
+    }
+}
+```
+
+#### 入库 / 检索流程图
+
+```mermaid
+sequenceDiagram
+    participant U as 用户/上传
+    participant App as RAG 服务
+    participant LD as 语言检测
+    participant MV as Milvus
+    participant ES as Elasticsearch
+
+    Note over U,ES: 入库
+    U->>App: 上传文档 chunk
+    App->>LD: detect(en/zh)
+    LD-->>App: lang=en
+    App->>MV: embed(document) → 写入向量
+    App->>ES: 写 text_en + metadata.lang=en
+
+    Note over U,ES: 检索（同语言）
+    U->>App: query「reduce hallucination」
+    App->>LD: detect → en
+    App->>MV: embed(query) → 向量 Top-K
+    App->>ES: match text_en + filter lang=en
+    App->>App: RRF + Rerank
+
+    Note over U,ES: 检索（跨语言）
+    U->>App: query「如何减少幻觉」（中文）
+    App->>MV: 向量召回英文 doc ✅
+    App->>ES: 搜 text_zh，英文 doc 难命中 ⚠️
+    App->>App: 靠 Milvus 路 + RRF 中向量排名
+```
+
+---
+
+### IK 插件：要不要装？
+
+| | **内置 cjk（代码现状）** | **IK（目标方案 · 中文路）** |
+| --- | --- | --- |
+| 作用 | CJK 双字 bigram 切分 | 中文词典分词（「机器学习」一词） |
+| 安装 | ES 自带 | 需装 `analysis-ik` 或定制镜像 |
+| 英文 | 靠 `standard` 子字段 | 同样靠 `text_en` + standard |
+| 适用 | 快速 POC | **中文文档多、关键词检索重要** |
+
+**结论**：文档语言单一且中文库要用 ES 关键词路 → **中文用 IK、英文用 standard 是 ES 侧最佳实践**；跨语言仍不依赖 IK。
+
+---
+
+### 什么方案 **不推荐** 作为主策略
+
+#### ❌ ES 同义词打通中英文互搜
+
+- 同义词只适合 **少量固定术语**（RAG↔检索增强、hallucination↔幻觉）。
+- 开放域中英词对 **无法穷举**，维护成本极高。
+- **跨语言语义**应交给 Milvus + v4；同义词最多作术语表 **锦上添花**。
+
+#### ❌ 入库/检索都用 `multi_match` 同时打 text_en + text_zh
+
+- 空字段、错误语言字段会引入噪声。
+- 应 **检测语言 → 只搜对应字段**。
+
+#### ❌ 指望 ES 单独完成「中文搜英文文档」
+
+- BM25 是词面匹配，中英 token 不对齐。
+- 可选增强：query 改写/翻译成英文后再搜 `text_en`（仍不如向量路自然）。
+
+---
+
+### 各场景谁负责（面试对照表）
+
+| 场景 | Milvus | ES |
+| --- | --- | --- |
+| 英文 query → 英文 doc | ✅ 语义 | ✅ standard 关键词 |
+| 中文 query → 中文 doc | ✅ 语义 | ✅ IK 关键词 |
+| 中文 query → 英文 doc | ✅ **主路径** | ❌ 弱 |
+| 英文 query → 中文 doc | ✅ **主路径** | ❌ 弱 |
+| SKU / 错误码 / 品牌精确命中 | 一般 | ✅ **强项** |
+
+---
+
+### RRF 融合（项目已实现）
+
+同一批 chunk 同时写入 Milvus 和 ES；检索时每个 query 走向量路 + 语言对应的 ES 路；跨 scope 时最多 **4 路** ranked list（租户 Milvus/ES + 系统 Milvus/ES）。
+
+两路分数量纲不同（Milvus 余弦 vs ES BM25），**不能直接加权相加**。项目用 **RRF**：
+
+- 公式：`score += 1 / (K + rank)`，项目中 **K=60**
+- 只依赖排名，对量纲不敏感
+- 融合后 **FlashRank MultiBERT** 重排，取 Top-10
+
+```mermaid
+flowchart LR
+    A[Milvus 排名列表] --> R[RRF 按 rank 融合]
+    B[ES 排名列表] --> R
+    R --> C[FlashRank 重排]
+    C --> D[Top-10 片段]
+```
+
+---
+
+### 面试 30 秒版（可直接背）
+
+> 我们文档要么纯英要么纯中，双路召回：Milvus 用通义 v4 做语义和跨语言，中英文同一向量空间；ES 按语言分字段，英文 standard、中文 IK，入库和查询都做语言检测，只写/只搜对应字段，并用 metadata.lang 过滤。RRF 融合两路排名后再 rerank。跨语言不靠 ES 同义词，同义词只维护少量 SEO/AI 术语；中文搜英文靠向量路，必要时 query 改写成英文再搜 ES。
+
+---
+
+### 与生成语言的关系
+
+| 环节 | 是否受「生成中/英文」影响 |
+| --- | --- |
+| 知识库 ES 怎么存 | ❌ 只看**源文档**语言 |
+| Milvus 向量 | ❌ 不分语言 |
+| 最终文章输出语言 | ✅ 仅 **LLM prompt / 模板** 控制 |
+
+---
+
+### 落地 Checklist（从现状演进到 IK 分路）
+
+- [ ] Docker ES 安装 `analysis-ik` 插件（或换带 IK 的镜像）
+- [ ] 上传链路增加 `detect_language()`，写入 `metadata.lang`
+- [ ] Mapping 改为 `text_en` + `text_zh`，更新 `INDEX_PROFILE` 后缀
+- [ ] 检索链路：检测 query 语言 → 路由 ES 字段 + 可选 lang filter
+- [ ] 全量 re-index（mapping/analyzer 变更不可复用旧索引）
+- [ ] （可选）少量业务同义词表，仅术语级，不替代向量跨语言
 
 ## 知识库
 ### 文档两级权限（项目已实现）
@@ -101,12 +326,19 @@ SEO 方法论更新、企业产品文档升级时重新解析、切块、embeddi
   2. **保留原 Query**：把用户的原始 Query 也作为其中一路去检索，作为兜底。
   3. **去重与过滤**：对生成的 Query 做小写去重，限制最多 5 个，防止过度发散带来大量噪声。
 
-### Q5：PDF 解析时，如果表格跨页了怎么处理？
+### Q5：中英文知识库，ES 怎么配？要不要 IK？同义词能打通中英互搜吗？
+**回答思路：**
+- **业务**：文档要么纯英要么纯中；生成语言由 LLM 控制，与 ES 无关。
+- **ES 最佳实践**：入库时语言检测 → 英文写 `text_en`（standard）、中文写 `text_zh`（ik_smart）；检索时检测 query 语言，只搜对应字段，并用 `metadata.lang` 过滤。
+- **跨语言**：中文搜英文 doc 靠 **Milvus + text-embedding-v4**，不靠 ES；同义词只维护少量术语（RAG、hallucination 等），不能当主方案。
+- **详见**：上文 [`如何双路召回`](#如何双路召回) 章节（含 Mermaid 架构图）。
+
+### Q6：PDF 解析时，如果表格跨页了怎么处理？
 **回答思路：**
 - **当前项目解法**：目前一期使用 `pdfplumber` 按页抽取（`page.extract_tables()`），跨页的表格会被截断成两个独立的 Markdown 表格。
 - **二期优化思路**：在内存中对比“上一页底部表格”和“下一页顶部表格”的表头（或者判断下一页顶部表格是否没有表头且列数一致）。如果一致，就在二维数组层面把它们拼接起来，最后再统一转成 Markdown 字符串。
 
-### Q6：怎么评估你的 RAG 系统到底好不好？
+### Q7：怎么评估你的 RAG 系统到底好不好？
 **回答思路：**
 - 我把评估分为两层，并在项目中通过 `eval/run_eval.py` 脚本落地：
 - **第一层：检索质量（不依赖 LLM，便宜快速）**：构建离线测试集（Query - 标注关键词），计算 **Recall@K**（召回率，是否召回了相关内容）和 **Precision@K**（准确率，Top-K 里有多少是相关的）。同时对比 RRF 融合前后、重排前后的指标变化。
@@ -329,14 +561,33 @@ SEO 方法论更新、企业产品文档升级时重新解析、切块、embeddi
 4. **稳定性**：多 provider 降级 + 重试 + （可加）语义缓存。
 
 ## Embedding 如何选型
-### 项目做法
-用 `BAAI/bge-small-en-v1.5`（英文、384 维），本地用 sentence-transformers 跑（embedding 不像 LLM 那样必须走付费 API，本地小模型即可，省成本）。重排用英文 cross-encoder `ms-marco-MiniLM-L-12-v2`（FlashRank）。
+
+> **完整对比文档**（OpenAI vs 通义/智谱/百度/豆包 vs 开源 BGE）：见 [`Document/Embedding选型对比.md`](Embedding选型对比.md)
+
+### 项目做法（当前实现）
+用通义 **`text-embedding-v4`**（1024 维 dense），走 **DashScope API**（与千问共用 `QIANWEN_API_KEY`）；入库 `text_type=document`，检索 `text_type=query`（非对称检索）。重排用多语言 cross-encoder `ms-marco-MultiBERT-L-12`（FlashRank）。**ES 按语言分路（英文 standard / 中文 IK）详见上文 [`如何双路召回`](#如何双路召回)**；代码现状仍为 standard+cjk，IK 为演进目标。Milvus 集合后缀 `INDEX_PROFILE=v4`。
+
+> 演进：纯英文 `bge-small-en-v1.5` → 本地 `bge-m3` → 当前 **text-embedding-v4 API**（模拟生产：全 API 化，免本地模型下载）。
+
+### 快速对比结论（面试 30 秒版）
+
+| 场景 | 推荐 | 不推荐 |
+| --- | --- | --- |
+| 纯英文 SEO | OpenAI `text-embedding-3-small` | 纯中文模型 |
+| 纯英文、要最高精度 | OpenAI `text-embedding-3-large` | 3-small（精度不够时） |
+| 中英混合（本项目） | 通义 `text-embedding-v4`（1024 维） | `3-large`（中文非最优）、`bge-small-en` |
+| 中文为主 | 通义 v4、Cohere embed-v4 | OpenAI large（中文非最优） |
+| 零 API 费、有 GPU | 自托管 `bge-m3` | 强行走 API |
+| 生成用豆包 | embedding 仍可用通义 v4 或 3-large | 不必强行同厂商 |
+
+> `text-embedding-3-large` 专项对比见 [`Embedding选型对比.md` §3.1.1](Embedding选型对比.md)。
 
 ### 选型逻辑（面试怎么说）
-1. **语言匹配**：内容是英文，必须用英文 embedding；中文模型在英文上效果差。
-2. **维度权衡**：small/384 检索快、占用小、效果够；不够再升级 base(768)/bge-m3（要重建 Milvus 集合）。
-3. **为什么 embedding 本地、LLM 走 API**：embedding 模型小、可离线、调用量大，本地跑省钱且稳定；生成式 LLM 大、迭代快，走 API 更划算。
-4. **要不要 rerank**：双路召回 + RRF 后用 cross-encoder 重排，能显著提升 Top-K 精度，cross-encoder 比 bi-encoder 更准但更慢，所以只对候选集（几十条）重排。
+1. **Embedding 与 LLM 解耦**：检索通义 v4 + 生成豆包/千问/DeepSeek，完全合理。
+2. **为什么不用 OpenAI embedding**：我们是中英混合 + 国内全 API，通义 v4 中文更好、与千问同 Key、无海外网络依赖。
+3. **为什么不用本地 bge-m3**：小公司生产通常不买 GPU 跑 embedding；本项目用 v4 API **模拟生产形态**。
+4. **评估再定**：用自建 query-doc 集测 Recall@K，别只看 MTEB；换模型必须 re-index。
+5. **Rerank 不能省**：双路召回 + RRF 后对候选集做 cross-encoder 重排。
 
 ## Java 和 Python 如何选型
 ### 项目做法（职责划分）

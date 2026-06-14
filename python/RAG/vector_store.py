@@ -44,7 +44,9 @@ class VectorStore:
 
     @staticmethod
     def collection_id(collection_name: str, tenant_id: str) -> str:
-        return f"{collection_name}_{tenant_id}"
+        profile = Config.INDEX_PROFILE.strip()
+        base = f"{collection_name}_{tenant_id}"
+        return f"{base}_{profile}" if profile else base
 
     def create_collection(self, collection_name: str, tenant_id: str = "default"):
         collection = self.collection_id(collection_name, tenant_id)
@@ -69,12 +71,18 @@ class VectorStore:
             self.milvus_collection = Collection(name=collection)
 
         if not self.es_client.indices.exists(index=collection):
+            # 中英双语：standard 照顾英文，text.cjk 照顾中文分词（无需 IK 插件）
             es_mappings = {
                 "mappings": {
                     "properties": {
-                        # 出海内容以英文为主，使用 english 分析器（不引入中文 IK 分词）
-                        "text": {"type": "text", "analyzer": "english"},
-                        "metadata": {"type": "object"}
+                        "text": {
+                            "type": "text",
+                            "analyzer": "standard",
+                            "fields": {
+                                "cjk": {"type": "text", "analyzer": "cjk"},
+                            },
+                        },
+                        "metadata": {"type": "object"},
                     }
                 }
             }
@@ -181,7 +189,13 @@ class VectorStore:
 
         results = self.es_client.search(
             index=collection,
-            query={"match": {"text": query}},
+            query={
+                "multi_match": {
+                    "query": query,
+                    "fields": ["text", "text.cjk"],
+                    "type": "best_fields",
+                }
+            },
             size=top_k,
         )
 

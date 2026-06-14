@@ -11,7 +11,7 @@ class RerankService:
     """
 
     def __init__(self):
-        # 出海英文内容，使用英文 cross-encoder（ms-marco-MiniLM）做重排
+        # 多语言 cross-encoder（默认 ms-marco-MultiBERT-L-12），中英文 query-doc 均可重排
         self.ranker = Ranker(model_name=Config.RERANK_MODEL)
 
     def rerank(self, query: str, docs: List[Dict[str, Any]], top_k: int = None) -> List[Dict[str, Any]]:

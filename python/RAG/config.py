@@ -1,4 +1,21 @@
+import importlib.util
 import os
+from pathlib import Path
+
+
+def _load_dashscope_api_key() -> str:
+    key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if key:
+        return key
+    # 直接加载 DAG/config.py，避免经 DAG 包 __init__ 引发与 RAG 的循环导入
+    try:
+        dag_config_path = Path(__file__).resolve().parent.parent / "DAG" / "config.py"
+        spec = importlib.util.spec_from_file_location("_dag_config", dag_config_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return getattr(module.Config, "QIANWEN_API_KEY", "")
+    except Exception:
+        return ""
 
 
 class Config:
@@ -12,10 +29,16 @@ class Config:
     POSTGRES_USER: str = os.getenv("POSTGRES_USER", "admin")
     POSTGRES_PASSWORD: str = os.getenv("POSTGRES_PASSWORD", "password")
 
-    # 业务以英文出海内容为主，embedding 使用英文模型；bge-small-en-v1.5 输出 384 维
-    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-    # 重排使用英文 cross-encoder（FlashRank 英文模型）
-    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "ms-marco-MiniLM-L-12-v2")
+    # 中英文双语：通义 text-embedding-v4（1024 维），DashScope API
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
+    DASHSCOPE_API_KEY: str = _load_dashscope_api_key()
+    DASHSCOPE_BASE_URL: str = os.getenv(
+        "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/api/v1"
+    )
+    # 重排使用多语言 cross-encoder（FlashRank MultiBERT，兼容中英文）
+    RERANK_MODEL: str = os.getenv("RERANK_MODEL", "ms-marco-MultiBERT-L-12")
+    # Milvus/ES 集合名后缀，切换 embedding 后须改后缀并重新入库（避免与旧维度/旧分词混用）
+    INDEX_PROFILE: str = os.getenv("INDEX_PROFILE", "v4")
 
     # 切块：一期用 tiktoken 控制 token 数（而非固定字符数）
     # 512 token ≈ 一个自然段落级语义单元；128 overlap ≈ 25% 重叠，缓解边界截断
@@ -24,8 +47,7 @@ class Config:
     # tiktoken 编码器名（cl100k_base 是 OpenAI 系通用编码，用于估算 token 数）
     TIKTOKEN_ENCODING: str = os.getenv("TIKTOKEN_ENCODING", "cl100k_base")
 
-    # bge-small-en-v1.5 输出 384 维
-    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "384"))
+    EMBEDDING_DIM: int = int(os.getenv("EMBEDDING_DIM", "1024"))
     # 双路召回每一路的候选数
     RECALL_TOP_K: int = int(os.getenv("RECALL_TOP_K", "20"))
     # 重排后最终返回数

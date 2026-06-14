@@ -24,7 +24,7 @@ class RetrievalEngine:
         self.rrf_k = Config.RRF_K
 
     def hybrid_search(self, query: str, collection_name: str, tenant_id: str = "default") -> List[Dict[str, Any]]:
-        query_embedding = self.embedding_service.embed_text(query)
+        query_embedding = self.embedding_service.embed_text(query, is_query=True)
 
         # 允许访问的 scope：当前租户 + 系统级（共享）
         scopes = [

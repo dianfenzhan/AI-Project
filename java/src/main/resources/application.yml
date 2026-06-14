@@ -4,6 +4,10 @@ server:
     context-path: /seo-java
 
 spring:
+  servlet:
+    multipart:
+      max-file-size: 200MB
+      max-request-size: 200MB
   datasource:
     url: jdbc:postgresql://localhost:5432/example_db
     username: admin

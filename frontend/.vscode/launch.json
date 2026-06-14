@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "chrome",
+      "request": "launch",
+      "name": "Debug Vue App",
+      "url": "http://localhost:5173/seo-frontend/",
+      "webRoot": "${workspaceFolder}/src",
+      "preLaunchTask": "dev-server",
+      "sourceMaps": true,
+      "pathMapping": {
+        "/@fs/": "${workspaceFolder}/",
+        "/src/": "${workspaceFolder}/src/"
+      }
+    }
+  ]
+}

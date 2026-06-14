@@ -263,11 +263,22 @@ API 密钥已配置在代码中，可通过环境变量覆盖：
 - `DOUBAO_API_KEY`
 - `SERP_API_KEY`
 - `DOUBAO_MODEL`（建议配置为方舟推理接入点 ID，例如 `ep-xxxxxx`）
-- `RERANK_MODEL`（默认 `ms-marco-MultiBERT-L-12`）
+
+RAG 检索（**中英文双语**，见 `python/RAG/config.py`）：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `EMBEDDING_MODEL` | `text-embedding-v4` | 通义多语言向量（DashScope API） |
+| `EMBEDDING_DIM` | `1024` | 须与模型一致 |
+| `RERANK_MODEL` | `ms-marco-MultiBERT-L-12` | 多语言重排 |
+| `INDEX_PROFILE` | `v4` | Milvus/ES 集合名后缀 |
+
+> Embedding API Key 默认复用 `DAG/config.py` 中的 `QIANWEN_API_KEY`；也可设置环境变量 `DASHSCOPE_API_KEY`。  
+> **切换 embedding 或 `INDEX_PROFILE` 后，必须重新上传文档**（旧集合不兼容）。新数据写入 `{collection}_{tenant}_v4` 这类带后缀的索引。
 
 ## 注意事项
 
 1. 所有服务的重启策略设置为 `no`，重启电脑后不会自动启动
 2. 租户隔离通过 `tenant_id` 和 `collection_name` 实现
-3. 首次启动需要下载相关 AI 模型
+3. 首次启动会下载 FlashRank MultiBERT 等小模型；Embedding 走通义 API，无需本地下载 bge-m3
 4. 依赖中 SerpAPI 对应包为 `google-search-results`
